@@ -6,9 +6,18 @@
 [stc-go](https://github.com/0xdenny218/stc-go), the Go implementation of the
 spatiotemporal composability paradigm.
 
-> Status: **M3 done** — every `*.wasm` in `--tools-dir` is a guest tool
-> fiber, hot-swapped in place when you rebuild it, mid-conversation. See
-> milestones below.
+> Status: **v0.1.0 released** — every `*.wasm` in `--tools-dir` is a guest
+> tool fiber, hot-swapped in place when you rebuild it, mid-conversation.
+> All milestones done (M0–M4).
+
+## Install
+
+```sh
+go install github.com/0xdenny218/stc-agent/cmd/stc-agent@latest
+```
+
+or clone and `go run ./cmd/stc-agent`. Running the agent only needs Go;
+developing guest tools additionally needs [TinyGo](https://tinygo.org/).
 
 ## Usage
 
@@ -100,7 +109,9 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 
 `scripts/demo-hotswap.sh` drives the whole scenario against the real model
 (build v1 → roll → rebuild v2 in place → roll again, asserting the version
-markers in the transcript). Notes: a guest that fails to load at boot fails
+markers in the transcript). The same scenario runs headless in CI as
+`TestE2EHotSwapKeepsSession` (scripted mock model), asserting a
+byte-identical tool list and a verbatim transcript across the swap. Notes: a guest that fails to load at boot fails
 the boot (fiber dump, exit 1); a guest that fails to *reload* keeps the old
 version serving. The descriptor is read once at load — a swap changes
 behavior, not the registered name/description.
@@ -133,7 +144,7 @@ behavior, not the registered name/description.
 - [x] M1 minimal chat loop (config/model/session/cli fibers, `/model` cascade)
 - [x] M2 tool system + agent loop (toolset as stable service, static Go tools)
 - [x] M3 WASM guest tools + hot reload (hmr): mid-conversation tool swap
-- [ ] M4 release + satellite-package review (what flows back into stc-go)
+- [x] M4 release + satellite-package review (v0.1.0 on GitHub; the review is filed as stc-go issues)
 
 ## Development
 

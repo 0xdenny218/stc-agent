@@ -5,8 +5,17 @@
 **万物皆插件的最小 CLI 对话 agent**——基于
 [stc-go](https://github.com/0xdenny218/stc-go)（时空可组合性范式的 Go 实现）。
 
-> 状态：**M3 完成**——`--tools-dir` 里的每个 `*.wasm` 都是 guest 工具
-> fiber，原地重建即在对话进行中热替换。里程碑见下。
+> 状态：**v0.1.0 已发布**——`--tools-dir` 里的每个 `*.wasm` 都是 guest
+> 工具 fiber，原地重建即在对话进行中热替换。里程碑全部完成（M0–M4）。
+
+## 安装
+
+```sh
+go install github.com/0xdenny218/stc-agent/cmd/stc-agent@latest
+```
+
+或克隆后 `go run ./cmd/stc-agent`。运行 agent 只需要 Go；开发 guest
+工具另需 [TinyGo](https://tinygo.org/)。
 
 ## 用法
 
@@ -92,7 +101,9 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 ```
 
 `scripts/demo-hotswap.sh` 对着真实模型驱动整个场景（构建 v1 → 掷骰 →
-原地重建 v2 → 再掷，并断言 transcript 里的版本标记）。注意：启动期
+原地重建 v2 → 再掷，并断言 transcript 里的版本标记）。同一场景在 CI
+里以 `TestE2EHotSwapKeepsSession` 无头运行（脚本化 mock 模型），断言
+换血前后工具表逐字节一致、transcript 逐字保留。注意：启动期
 装载失败的 guest 会让启动失败（fiber 状态转储，退出码 1）；重载期失败
 的 guest 保留旧版本继续服役。描述只在初次装载时读取——换血换的是
 行为，不是已注册的名字/描述。
@@ -122,7 +133,7 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 - [x] M1 最小对话闭环（config/model/session/cli fiber，/model 级联）
 - [x] M2 工具系统 + agent 循环（toolset 稳定服务、静态 Go 工具）
 - [x] M3 WASM guest 工具 + 热重载（hmr）：对话中途换工具
-- [ ] M4 发布 + 回流评审（哪些模式回流入 stc-go）
+- [x] M4 发布 + 回流评审（v0.1.0 已上 GitHub；评审产出为 stc-go issues）
 
 ## 开发
 
