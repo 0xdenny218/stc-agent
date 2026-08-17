@@ -47,7 +47,7 @@ func TestCommandEffect(t *testing.T) {
 		t.Fatalf("resolve registry: %v", err)
 	}
 	var buf bytes.Buffer
-	handled, err := reg.Dispatch(ctx, &buf, "/x hello")
+	handled, err := Dispatch(ctx, &buf, "/x hello", reg)
 	if err != nil || !handled {
 		t.Fatalf("dispatch: handled=%v err=%v", handled, err)
 	}
@@ -59,7 +59,7 @@ func TestCommandEffect(t *testing.T) {
 	if err := cf.Gone(ctx); err != nil {
 		t.Fatalf("waiting command gone: %v", err)
 	}
-	if handled, _ := reg.Dispatch(ctx, &buf, "/x hello"); handled {
+	if handled, _ := Dispatch(ctx, &buf, "/x hello", reg); handled {
 		t.Fatal("command still registered after its fiber unloaded")
 	}
 }

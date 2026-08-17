@@ -99,7 +99,7 @@ func serve(ctx stdctx.Context, console *Console, r loop.Runner, reg *Registry, e
 				console.signalDone()
 				return
 			case strings.HasPrefix(line, "/"):
-				handled, err := reg.Dispatch(ctx, w, line)
+				handled, err := Dispatch(ctx, w, line, reg)
 				switch {
 				case !handled:
 					name, _, _ := strings.Cut(strings.TrimPrefix(line, "/"), " ")

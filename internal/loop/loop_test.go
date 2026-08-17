@@ -11,6 +11,7 @@ import (
 	"github.com/0xdenny218/stc-agent/internal/model"
 	"github.com/0xdenny218/stc-agent/internal/session"
 	"github.com/0xdenny218/stc-agent/internal/tools"
+	"github.com/0xdenny218/stc-go/registry"
 )
 
 // stubChat 按队列应答并记录每次请求。
@@ -52,8 +53,8 @@ func echoTool() tools.Tool {
 // user/assistant(tool_calls)/tool/assistant，工具结果回灌进下一次请求。
 func TestRunTurnToolCallLoop(t *testing.T) {
 	sess := &session.Session{}
-	ts := tools.NewToolset()
-	ts.Register(echoTool())
+	ts := registry.New[tools.Tool]()
+	ts.Register("echo", echoTool())
 	chat := &stubChat{replies: []model.Message{
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c1", "echo", `{"x":1}`)}},
 		{Role: "assistant", Content: "done"},
@@ -99,8 +100,8 @@ func TestRunTurnToolCallLoop(t *testing.T) {
 // Contract/MaxTurns：连续工具调用不收敛时熔断（spec M2 验收）。
 func TestRunTurnMaxTurns(t *testing.T) {
 	sess := &session.Session{}
-	ts := tools.NewToolset()
-	ts.Register(echoTool())
+	ts := registry.New[tools.Tool]()
+	ts.Register("echo", echoTool())
 	chat := &stubChat{replies: []model.Message{
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c1", "echo", `{}`)}},
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c2", "echo", `{}`)}},
@@ -124,10 +125,10 @@ func TestRunTurnMaxTurns(t *testing.T) {
 // 历史保持线格式合法（每个 tool_call 恰有一条 tool 应答）。
 func TestRunTurnAbortFillsToolResults(t *testing.T) {
 	sess := &session.Session{}
-	ts := tools.NewToolset()
+	ts := registry.New[tools.Tool]()
 	ctx, cancel := stdctx.WithCancel(stdctx.Background())
 	defer cancel()
-	ts.Register(tools.Tool{
+	ts.Register("block", tools.Tool{
 		Name: "block", Description: "cancels the turn mid-loop",
 		Parameters: json.RawMessage(`{"type":"object"}`),
 		Invoke: func(stdctx.Context, json.RawMessage) (string, error) {
@@ -135,7 +136,7 @@ func TestRunTurnAbortFillsToolResults(t *testing.T) {
 			return "interrupted", nil
 		},
 	})
-	ts.Register(echoTool())
+	ts.Register("echo", echoTool())
 	chat := &stubChat{replies: []model.Message{
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c1", "block", `{}`), fnCall("c2", "echo", `{}`)}},
 	}}

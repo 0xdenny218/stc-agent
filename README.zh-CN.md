@@ -46,7 +46,10 @@ REPL 内命令：
 - `/quit`——退出。
 
 工具（每个工具是独立 fiber，注册进稳定的 toolset 服务，因此工具增删
-不会重载 agent 循环）：
+不会重载 agent 循环——toolset 与斜杠命令注册表就是
+[`stc-go/registry`](https://github.com/0xdenny218/stc-go/tree/main/registry)，
+首个完整回流循环：模式在此重复两处 → 提取到上游 → 本仓库删除自己的
+副本）：
 
 - `read_file` / `write_file`——文件读写，输出上限 32 KiB。
 - `shell`——`sh -c` 执行，30 秒超时，工作目录固定为启动目录。

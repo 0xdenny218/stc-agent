@@ -87,7 +87,7 @@ func GuestToolComponent(path string, onReload func(name string, err error)) stc.
 				h.Dispose()
 				return nil, fmt.Errorf("guest tool %s: bad descriptor: %w", name, err)
 			}
-			unregister := ts.Register(tools.Tool{
+			unregister := ts.Register(name, tools.Tool{
 				Name:        name,
 				Description: d.Description,
 				Parameters:  d.Parameters,

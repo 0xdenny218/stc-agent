@@ -49,7 +49,10 @@ Commands inside the REPL:
 - `/quit` — exit.
 
 Tools (each is its own fiber registering into a stable toolset service, so
-tool churn never reloads the agent loop):
+tool churn never reloads the agent loop — the toolset and the slash-command
+registry are [`stc-go/registry`](https://github.com/0xdenny218/stc-go/tree/main/registry),
+the first completed reflux cycle: the pattern repeated here twice, was
+extracted upstream, and this repo deleted its own copies):
 
 - `read_file` / `write_file` — filesystem access, 32 KiB output cap.
 - `shell` — `sh -c` with a 30s timeout, working directory pinned to the

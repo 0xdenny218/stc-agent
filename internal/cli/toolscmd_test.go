@@ -39,7 +39,7 @@ func TestToolsCommandEffect(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if handled, err := reg.Dispatch(ctx, &buf, "/tools"); err != nil || !handled {
+	if handled, err := Dispatch(ctx, &buf, "/tools", reg); err != nil || !handled {
 		t.Fatalf("dispatch /tools: handled=%v err=%v", handled, err)
 	}
 	if !strings.Contains(buf.String(), "no tools registered") {
@@ -48,7 +48,7 @@ func TestToolsCommandEffect(t *testing.T) {
 
 	load(tools.ReadFileComponent())
 	buf.Reset()
-	if _, err := reg.Dispatch(ctx, &buf, "/tools"); err != nil {
+	if _, err := Dispatch(ctx, &buf, "/tools", reg); err != nil {
 		t.Fatalf("dispatch /tools: %v", err)
 	}
 	if !strings.Contains(buf.String(), "read_file — read the contents of a file") {
@@ -56,7 +56,7 @@ func TestToolsCommandEffect(t *testing.T) {
 	}
 
 	buf.Reset()
-	if _, err := reg.Dispatch(ctx, &buf, "/help"); err != nil {
+	if _, err := Dispatch(ctx, &buf, "/help", reg); err != nil {
 		t.Fatalf("dispatch /help: %v", err)
 	}
 	for _, want := range []string{"/help", "/tools", "/quit"} {
@@ -69,7 +69,7 @@ func TestToolsCommandEffect(t *testing.T) {
 	if err := tf.Gone(ctx); err != nil {
 		t.Fatalf("tools command gone: %v", err)
 	}
-	if handled, _ := reg.Dispatch(ctx, &buf, "/tools"); handled {
+	if handled, _ := Dispatch(ctx, &buf, "/tools", reg); handled {
 		t.Fatal("/tools still registered after its fiber unloaded")
 	}
 }
