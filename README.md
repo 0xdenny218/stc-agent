@@ -111,7 +111,22 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 (build v1 → roll → rebuild v2 in place → roll again, asserting the version
 markers in the transcript). The same scenario runs headless in CI as
 `TestE2EHotSwapKeepsSession` (scripted mock model), asserting a
-byte-identical tool list and a verbatim transcript across the swap. Notes: a guest that fails to load at boot fails
+byte-identical tool list and a verbatim transcript across the swap.
+
+A real run (2026-08-17, GLM `glm-4-flash` via their OpenAI-compatible
+endpoint — only the `STC_AGENT_BASE_URL`/`STC_AGENT_API_KEY`/
+`STC_AGENT_MODEL` env vars changed, no code):
+
+```
+==> turn 1: asking the model to roll (dice v1 on disk)
+    tool result: {"role":"tool","content":"{\"roll\":3,\"sides\":6,\"version\":\"v1\"}", ...}
+==> rebuilding dice.wasm in place as v2 (agent pid 79297 keeps running)
+    hot-swap landed; agent still pid 79297
+==> turn 2: asking again (v2 now serving)
+    tool result: {"role":"tool","content":"{\"roll\":3,\"sides\":6,\"version\":\"v2\"}", ...}
+```
+
+Notes: a guest that fails to load at boot fails
 the boot (fiber dump, exit 1); a guest that fails to *reload* keeps the old
 version serving. The descriptor is read once at load — a swap changes
 behavior, not the registered name/description.

@@ -103,7 +103,22 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 `scripts/demo-hotswap.sh` 对着真实模型驱动整个场景（构建 v1 → 掷骰 →
 原地重建 v2 → 再掷，并断言 transcript 里的版本标记）。同一场景在 CI
 里以 `TestE2EHotSwapKeepsSession` 无头运行（脚本化 mock 模型），断言
-换血前后工具表逐字节一致、transcript 逐字保留。注意：启动期
+换血前后工具表逐字节一致、transcript 逐字保留。
+
+一次真实运行实录（2026-08-17，GLM `glm-4-flash`，走其 OpenAI 兼容
+端点——只改了 `STC_AGENT_BASE_URL`/`STC_AGENT_API_KEY`/
+`STC_AGENT_MODEL` 三个环境变量，零代码改动）：
+
+```
+==> turn 1: asking the model to roll (dice v1 on disk)
+    tool result: {"role":"tool","content":"{\"roll\":3,\"sides\":6,\"version\":\"v1\"}", ...}
+==> rebuilding dice.wasm in place as v2 (agent pid 79297 keeps running)
+    hot-swap landed; agent still pid 79297
+==> turn 2: asking again (v2 now serving)
+    tool result: {"role":"tool","content":"{\"roll\":3,\"sides\":6,\"version\":\"v2\"}", ...}
+```
+
+注意：启动期
 装载失败的 guest 会让启动失败（fiber 状态转储，退出码 1）；重载期失败
 的 guest 保留旧版本继续服役。描述只在初次装载时读取——换血换的是
 行为，不是已注册的名字/描述。
