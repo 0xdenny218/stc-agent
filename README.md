@@ -116,15 +116,14 @@ markers in the transcript). The same scenario runs headless in CI as
 `TestE2EHotSwapKeepsSession` (scripted mock model), asserting a
 byte-identical tool list and a verbatim transcript across the swap.
 
-A real run (2026-08-17, GLM `glm-4-flash` via their OpenAI-compatible
-endpoint — only the `STC_AGENT_BASE_URL`/`STC_AGENT_API_KEY`/
+A real run (2026-08-17, GLM `glm-4.5` via their Coding Plan endpoint — only the `STC_AGENT_BASE_URL`/`STC_AGENT_API_KEY`/
 `STC_AGENT_MODEL` env vars changed, no code):
 
 ```
 ==> turn 1: asking the model to roll (dice v1 on disk)
     tool result: {"role":"tool","content":"{\"roll\":3,\"sides\":6,\"version\":\"v1\"}", ...}
-==> rebuilding dice.wasm in place as v2 (agent pid 79297 keeps running)
-    hot-swap landed; agent still pid 79297
+==> rebuilding dice.wasm in place as v2 (agent pid 88227 keeps running)
+    hot-swap landed; agent still pid 88227
 ==> turn 2: asking again (v2 now serving)
     tool result: {"role":"tool","content":"{\"roll\":3,\"sides\":6,\"version\":\"v2\"}", ...}
 ```

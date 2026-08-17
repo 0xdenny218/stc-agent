@@ -108,15 +108,15 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 里以 `TestE2EHotSwapKeepsSession` 无头运行（脚本化 mock 模型），断言
 换血前后工具表逐字节一致、transcript 逐字保留。
 
-一次真实运行实录（2026-08-17，GLM `glm-4-flash`，走其 OpenAI 兼容
+一次真实运行实录（2026-08-17，GLM `glm-4.5`，走其 Coding Plan
 端点——只改了 `STC_AGENT_BASE_URL`/`STC_AGENT_API_KEY`/
 `STC_AGENT_MODEL` 三个环境变量，零代码改动）：
 
 ```
 ==> turn 1: asking the model to roll (dice v1 on disk)
     tool result: {"role":"tool","content":"{\"roll\":3,\"sides\":6,\"version\":\"v1\"}", ...}
-==> rebuilding dice.wasm in place as v2 (agent pid 79297 keeps running)
-    hot-swap landed; agent still pid 79297
+==> rebuilding dice.wasm in place as v2 (agent pid 88227 keeps running)
+    hot-swap landed; agent still pid 88227
 ==> turn 2: asking again (v2 now serving)
     tool result: {"role":"tool","content":"{\"roll\":3,\"sides\":6,\"version\":\"v2\"}", ...}
 ```
