@@ -104,3 +104,57 @@ func TestChatClientContract(t *testing.T) {
 		}
 	})
 }
+
+// Contract/ChatTools：tools 请求的线格式与 tool_calls 响应的解析
+// （spec M2；OpenAI 工具调用协议）。
+func TestChatClientTools(t *testing.T) {
+	var gotBody wireRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"/tmp/x\"}"}}]}}]}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "k", "m1", time.Second)
+	resp, err := c.Chat(stdctx.Background(), ChatRequest{
+		Messages: []Message{{Role: "user", Content: "read /tmp/x"}},
+		Tools: []ToolSpec{{
+			Name: "read_file", Description: "read a file",
+			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+
+	if len(gotBody.Tools) != 1 {
+		t.Fatalf("request tools: %+v", gotBody.Tools)
+	}
+	wt := gotBody.Tools[0]
+	if wt.Type != "function" || wt.Function.Name != "read_file" || wt.Function.Description != "read a file" {
+		t.Fatalf("wire tool: %+v", wt)
+	}
+	if string(wt.Function.Parameters) != `{"type":"object","properties":{"path":{"type":"string"}}}` {
+		t.Fatalf("wire tool parameters: %s", wt.Function.Parameters)
+	}
+
+	if len(resp.Message.ToolCalls) != 1 {
+		t.Fatalf("response tool_calls: %+v", resp.Message)
+	}
+	tc := resp.Message.ToolCalls[0]
+	if tc.ID != "call_1" || tc.Type != "function" || tc.Function.Name != "read_file" || tc.Function.Arguments != `{"path":"/tmp/x"}` {
+		t.Fatalf("tool_call: %+v", tc)
+	}
+
+	// 无工具时线格式省略 tools 字段。
+	b, err := json.Marshal(wireRequest{Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "tools") {
+		t.Fatalf("tools field must be omitted when empty: %s", b)
+	}
+}

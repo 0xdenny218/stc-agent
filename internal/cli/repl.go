@@ -8,8 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/0xdenny218/stc-agent/internal/model"
-	"github.com/0xdenny218/stc-agent/internal/session"
+	"github.com/0xdenny218/stc-agent/internal/loop"
 	stc "github.com/0xdenny218/stc-go"
 )
 
@@ -52,18 +51,15 @@ func (c *Console) Done() <-chan struct{} { return c.done }
 
 func (c *Console) signalDone() { c.doneOnce.Do(func() { close(c.done) }) }
 
-// Component 是 REPL fiber：inject chat/session/commands，每个装载周期起
-// 一个循环 goroutine；逆 = 取消周期并等其退出。
+// Component 是 REPL fiber：inject runner（轮次执行）与 commands（命令分
+// 发）。换模型时 runner 随级联重载，本 fiber 亦换周期；控制台外置故
+// 输入不丢。
 func Component(console *Console) stc.Component {
 	return stc.Component{
 		Name:   "cli",
-		Inject: []stc.Key{model.KeyChat, session.KeySession, KeyCommands},
+		Inject: []stc.Key{loop.KeyRunner, KeyCommands},
 		Apply: func(c *stc.Context) (stc.Inverse, error) {
-			chat, err := stc.Service[model.ChatService](c, model.KeyChat)
-			if err != nil {
-				return nil, err
-			}
-			sess, err := stc.Service[*session.Session](c, session.KeySession)
+			r, err := stc.Service[loop.Runner](c, loop.KeyRunner)
 			if err != nil {
 				return nil, err
 			}
@@ -73,7 +69,7 @@ func Component(console *Console) stc.Component {
 			}
 			ctx, cancel := stdctx.WithCancel(stdctx.Background())
 			exited := make(chan struct{})
-			go loop(ctx, console, chat, sess, reg, exited)
+			go serve(ctx, console, r, reg, exited)
 			return func() error {
 				cancel()
 				<-exited
@@ -83,7 +79,7 @@ func Component(console *Console) stc.Component {
 	}
 }
 
-func loop(ctx stdctx.Context, console *Console, chat model.ChatService, sess *session.Session, reg *Registry, exited chan<- struct{}) {
+func serve(ctx stdctx.Context, console *Console, r loop.Runner, reg *Registry, exited chan<- struct{}) {
 	defer close(exited)
 	w := console.out
 	fmt.Fprint(w, "> ")
@@ -112,33 +108,14 @@ func loop(ctx stdctx.Context, console *Console, chat model.ChatService, sess *se
 					fmt.Fprintf(w, "error: %v\n", err)
 				}
 			default:
-				if !turn(ctx, w, chat, sess, line) {
-					return // 周期被取消（级联重载）；新周期会接替
+				if err := r.RunTurn(ctx, line, w); err != nil {
+					if ctx.Err() != nil {
+						return // 周期被取消（级联重载）；新周期会接替
+					}
+					fmt.Fprintf(w, "error: %v\n", err)
 				}
 			}
 			fmt.Fprint(w, "> ")
 		}
 	}
-}
-
-// turn 跑一轮问答；false 表示周期 ctx 在调用中途被取消。
-func turn(ctx stdctx.Context, w io.Writer, chat model.ChatService, sess *session.Session, input string) bool {
-	if err := sess.Add(model.Message{Role: "user", Content: input}); err != nil {
-		fmt.Fprintf(w, "error: %v\n", err)
-		return true
-	}
-	resp, err := chat.Chat(ctx, model.ChatRequest{Messages: sess.History()})
-	if err != nil {
-		if ctx.Err() != nil {
-			return false
-		}
-		fmt.Fprintf(w, "error: %v\n", err)
-		return true
-	}
-	if err := sess.Add(model.Message{Role: "assistant", Content: resp.Message.Content}); err != nil {
-		fmt.Fprintf(w, "error: %v\n", err)
-		return true
-	}
-	fmt.Fprintln(w, resp.Message.Content)
-	return true
 }

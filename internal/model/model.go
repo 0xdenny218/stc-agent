@@ -21,14 +21,36 @@ import (
 // KeyChat 是模型对话服务。
 var KeyChat = stc.NewKey[ChatService]("chat")
 
-// Message 是一条对话消息（M1 只有 role/content；M2 扩展 tool_calls）。
+// Message 是一条对话消息。ToolCalls/ToolCallID 承载 OpenAI 工具调用协议：
+// assistant 消息带 ToolCalls，tool 消息以 ToolCallID 回指。
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"` // 恒为 "function"
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // JSON 字符串
+}
+
+// ToolSpec 是工具的线格式描述（JSON Schema 参数）。
+type ToolSpec struct {
+	Name        string
+	Description string
+	Parameters  json.RawMessage
 }
 
 type ChatRequest struct {
 	Messages []Message
+	Tools    []ToolSpec // 空则线格式省略 tools 字段
 }
 
 type ChatResponse struct {
@@ -88,10 +110,22 @@ func NewClient(baseURL, apiKey, model string, timeout time.Duration) ChatService
 
 func (c *client) Model() string { return c.model }
 
+type wireToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+type wireTool struct {
+	Type     string           `json:"type"` // 恒为 "function"
+	Function wireToolFunction `json:"function"`
+}
+
 type wireRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
+	Model    string     `json:"model"`
+	Messages []Message  `json:"messages"`
+	Stream   bool       `json:"stream"`
+	Tools    []wireTool `json:"tools,omitempty"`
 }
 
 type wireResponse struct {
@@ -104,7 +138,14 @@ func (c *client) Chat(ctx stdctx.Context, req ChatRequest) (*ChatResponse, error
 	ctx, cancel := stdctx.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	body, err := json.Marshal(wireRequest{Model: c.model, Messages: req.Messages, Stream: false})
+	wreq := wireRequest{Model: c.model, Messages: req.Messages, Stream: false}
+	for _, t := range req.Tools {
+		wreq.Tools = append(wreq.Tools, wireTool{
+			Type:     "function",
+			Function: wireToolFunction{Name: t.Name, Description: t.Description, Parameters: t.Parameters},
+		})
+	}
+	body, err := json.Marshal(wreq)
 	if err != nil {
 		return nil, fmt.Errorf("model: encode request: %w", err)
 	}

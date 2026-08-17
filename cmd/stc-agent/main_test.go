@@ -231,3 +231,150 @@ func TestRunRequiresAPIKey(t *testing.T) {
 		t.Fatalf("output: %s", out.String())
 	}
 }
+
+// E2E/ToolCallLoop：mock 服务器先要求 read_file，再给出最终答复。断言：
+//   - stdout 出现工具轨迹 "→ read_file(...)" 与最终答复；
+//   - 第二次请求携带 3 条消息（user/assistant/tool），tool 消息内容为文件
+//     内容（真实工具执行，非 mock）；
+//   - 首个请求带全部三个工具；transcript 逐字记录 4 条消息。
+func TestE2EToolCallLoop(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(target, []byte("hello-e2e"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var counts []int
+	var toolNames []string
+	var toolMsg model.Message
+	callN := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []model.Message `json:"messages"`
+			Tools    []struct {
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		callN++
+		n := callN
+		counts = append(counts, len(req.Messages))
+		if n == 1 {
+			for _, tool := range req.Tools {
+				toolNames = append(toolNames, tool.Function.Name)
+			}
+		}
+		if n == 2 {
+			for _, m := range req.Messages {
+				if m.Role == "tool" {
+					toolMsg = m
+				}
+			}
+		}
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		var msg model.Message
+		if n == 1 {
+			args, _ := json.Marshal(map[string]string{"path": target})
+			msg = model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
+				ID: "call_1", Type: "function",
+				Function: model.ToolCallFunction{Name: "read_file", Arguments: string(args)},
+			}}}
+		} else {
+			msg = model.Message{Role: "assistant", Content: "The file says hello-e2e"}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": msg}}})
+	}))
+	defer srv.Close()
+
+	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
+	args := []string{
+		"--api-key", "test",
+		"--base-url", srv.URL,
+		"--model", "m",
+		"--transcript", transcript,
+	}
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	out := &syncBuffer{}
+	exit := make(chan int, 1)
+	go func() { exit <- run(args, inR, out, func(string) string { return "" }) }()
+
+	waitFor := func(what string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for !out.Contains(what) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %q; output:\n%s", what, out.String())
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if _, err := io.WriteString(inW, "please read the note\n"); err != nil {
+		t.Fatalf("feed stdin: %v", err)
+	}
+	waitFor("The file says hello-e2e")
+	if !out.Contains("→ read_file(") {
+		t.Fatalf("tool trace missing; output:\n%s", out.String())
+	}
+	if _, err := io.WriteString(inW, "/quit\n"); err != nil {
+		t.Fatalf("feed stdin: %v", err)
+	}
+
+	select {
+	case code := <-exit:
+		if code != 0 {
+			t.Fatalf("exit code %d; output:\n%s", code, out.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("run did not exit; output:\n%s", out.String())
+	}
+
+	mu.Lock()
+	if !reflect.DeepEqual(counts, []int{1, 3}) {
+		t.Fatalf("message counts per request: %v (tool round-trip lost?)", counts)
+	}
+	if !reflect.DeepEqual(toolNames, []string{"read_file", "shell", "write_file"}) {
+		t.Fatalf("tools advertised: %v", toolNames)
+	}
+	if toolMsg.ToolCallID != "call_1" || !strings.Contains(toolMsg.Content, "hello-e2e") {
+		t.Fatalf("tool message in second request: %+v", toolMsg)
+	}
+	mu.Unlock()
+
+	f, err := os.Open(transcript)
+	if err != nil {
+		t.Fatalf("open transcript: %v", err)
+	}
+	defer f.Close()
+	var msgs []model.Message
+	dec := json.NewDecoder(f)
+	for dec.More() {
+		var m model.Message
+		if err := dec.Decode(&m); err != nil {
+			t.Fatalf("decode transcript: %v", err)
+		}
+		msgs = append(msgs, m)
+	}
+	if len(msgs) != 4 {
+		t.Fatalf("transcript messages: %d: %+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "user" || msgs[1].Role != "assistant" || msgs[2].Role != "tool" || msgs[3].Role != "assistant" {
+		t.Fatalf("transcript roles: %+v", msgs)
+	}
+	if len(msgs[1].ToolCalls) != 1 || msgs[1].ToolCalls[0].Function.Name != "read_file" {
+		t.Fatalf("transcript assistant tool_calls: %+v", msgs[1])
+	}
+	if msgs[2].ToolCallID != "call_1" || !strings.Contains(msgs[2].Content, "hello-e2e") {
+		t.Fatalf("transcript tool message: %+v", msgs[2])
+	}
+}

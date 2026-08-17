@@ -1,7 +1,7 @@
 // Command stc-agent is a minimal CLI chat agent where every capability is a
-// fiber, built on stc-go. M1: minimal chat loop — config/model/session/cli
-// fibers plus the /model command; model switching cascades while history
-// survives.
+// fiber, built on stc-go. M2: multi-turn tool calling — the loop fiber drives
+// [model → tool]* rounds against the static Go tool fibers (read_file,
+// write_file, shell); /tools and /help are command fibers.
 package main
 
 import (
@@ -16,8 +16,10 @@ import (
 
 	"github.com/0xdenny218/stc-agent/internal/cli"
 	"github.com/0xdenny218/stc-agent/internal/config"
+	"github.com/0xdenny218/stc-agent/internal/loop"
 	"github.com/0xdenny218/stc-agent/internal/model"
 	"github.com/0xdenny218/stc-agent/internal/session"
+	"github.com/0xdenny218/stc-agent/internal/tools"
 	stc "github.com/0xdenny218/stc-go"
 )
 
@@ -154,6 +156,11 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 
 	_, ctlComp := config.NewControl(root, opts.cfg)
 	console := cli.NewConsole(stdin, stdout)
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(stdout, "error: %v\n", err)
+		return 2
+	}
 
 	// 装配列表（spec D2）：提供者在前，依赖由 inject 解析。
 	comps := []stc.Component{
@@ -161,7 +168,14 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		model.Component(),
 		session.Component(opts.transcript),
 		cli.RegistryComponent(),
+		tools.ToolsetComponent(),
+		tools.ReadFileComponent(),
+		tools.WriteFileComponent(),
+		tools.ShellComponent(cwd, 30*time.Second),
+		loop.Component(10),
 		cli.ModelCommandComponent(),
+		cli.ToolsCommandComponent(),
+		cli.HelpCommandComponent(),
 		cli.Component(console),
 	}
 	fibers := make([]*stc.Fiber, 0, len(comps))

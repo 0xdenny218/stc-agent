@@ -6,8 +6,9 @@
 [stc-go](https://github.com/0xdenny218/stc-go), the Go implementation of the
 spatiotemporal composability paradigm.
 
-> Status: **M1 done** — minimal chat loop works: config/model/session/cli
-> fibers, `/model` cascade, JSONL transcript with resume. See milestones below.
+> Status: **M2 done** — the agent loop drives multi-turn tool calling against
+> the static Go tool fibers (`read_file`, `write_file`, `shell`). See
+> milestones below.
 
 ## Usage
 
@@ -33,7 +34,24 @@ Commands inside the REPL:
 - `/model <name>` — switch models mid-conversation. This re-provides the
   config service; the model client and REPL reload reactively, while the
   session fiber (which depends on neither) keeps the history verbatim.
+- `/tools` — list registered tools.
+- `/help` — list commands.
 - `/quit` — exit.
+
+Tools (each is its own fiber registering into a stable toolset service, so
+tool churn never reloads the agent loop):
+
+- `read_file` / `write_file` — filesystem access, 32 KiB output cap.
+- `shell` — `sh -c` with a 30s timeout, working directory pinned to the
+  launch directory. **There is no permission pipeline: the model can run
+  arbitrary commands as your user.** Run it only in directories you are
+  comfortable with.
+
+A turn runs `[model → tool]*` until the model answers (tool calls are traced
+as `→ name(args)`), with a circuit breaker of 10 tool iterations. Tool
+failures are fed back to the model as result text, not turn-fatal errors; a
+mid-turn reload fills unanswered tool calls with an aborted marker so the
+transcript stays wire-valid.
 
 ## What it is
 
@@ -61,7 +79,7 @@ Commands inside the REPL:
 
 - [x] M0 scaffold (repo, CI, bilingual README, main skeleton)
 - [x] M1 minimal chat loop (config/model/session/cli fibers, `/model` cascade)
-- [ ] M2 tool system + agent loop (toolset as stable service, static Go tools)
+- [x] M2 tool system + agent loop (toolset as stable service, static Go tools)
 - [ ] M3 WASM guest tools + hot reload (hmr): mid-conversation tool swap
 - [ ] M4 release + satellite-package review (what flows back into stc-go)
 
