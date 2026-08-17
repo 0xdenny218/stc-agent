@@ -2,7 +2,7 @@ module github.com/0xdenny218/stc-agent
 
 go 1.25.0
 
-require github.com/0xdenny218/stc-go v0.2.1-0.20260817115127-395bd8f7ae6f
+require github.com/0xdenny218/stc-go v0.3.0
 
 require (
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
