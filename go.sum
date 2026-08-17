@@ -1,2 +1,8 @@
-github.com/0xdenny218/stc-go v0.2.0 h1:gheguBeSg4/iYLmoTdtcaIahyTnQOELAJtPzwdQ9NN4=
-github.com/0xdenny218/stc-go v0.2.0/go.mod h1:PeQD3yNZrXa0nYlki1ib27e898VeaPJulVKp1F1bp1o=
+github.com/0xdenny218/stc-go v0.2.1-0.20260817115127-395bd8f7ae6f h1:dNdezooFRq3Qm6ZJ+G0ZThczi1fV65/wVZyVrHiiuOo=
+github.com/0xdenny218/stc-go v0.2.1-0.20260817115127-395bd8f7ae6f/go.mod h1:PeQD3yNZrXa0nYlki1ib27e898VeaPJulVKp1F1bp1o=
+github.com/fsnotify/fsnotify v1.10.1 h1:b0/UzAf9yR5rhf3RPm9gf3ehBPpf0oZKIjtpKrx59Ho=
+github.com/fsnotify/fsnotify v1.10.1/go.mod h1:TLheqan6HD6GBK6PrDWyDPBaEV8LspOxvPSjC+bVfgo=
+github.com/tetratelabs/wazero v1.12.0 h1:DuWcpNu/FzgEXgGBDp8J1Spc+CWOvvtvVyjKlaZopYU=
+github.com/tetratelabs/wazero v1.12.0/go.mod h1:LvKtzl2RqO4gyF27BiXU+nKAjcV8f38U+kP/q2vgxh0=
+golang.org/x/sys v0.44.0 h1:ildZl3J4uzeKP07r2F++Op7E9B29JRUy+a27EibtBTQ=
+golang.org/x/sys v0.44.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=

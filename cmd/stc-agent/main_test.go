@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/0xdenny218/stc-agent/internal/model"
+	"github.com/0xdenny218/stc-agent/internal/testutil"
 )
 
 func TestParseOptions(t *testing.T) {
@@ -376,5 +377,159 @@ func TestE2EToolCallLoop(t *testing.T) {
 	}
 	if msgs[2].ToolCallID != "call_1" || !strings.Contains(msgs[2].Content, "hello-e2e") {
 		t.Fatalf("transcript tool message: %+v", msgs[2])
+	}
+}
+
+// E2E/HotSwapKeepsSession（spec M3 验收）：对话进行中热替换 guest 工具。
+// 第一轮模型调用 dice（v1 结果）→ 进程内重建 dice.wasm 为 v2 →
+// 第二轮即走 v2；同一会话进程，历史逐字保留。需要 TinyGo（缺失即 Skip）。
+func TestE2EHotSwapKeepsSession(t *testing.T) {
+	toolsDir := t.TempDir()
+	dicePath := testutil.BuildGuest(t, "examples/guests/dice", filepath.Join(toolsDir, "dice.wasm"))
+
+	var mu sync.Mutex
+	callN := 0
+	toolNames := map[int][]string{} // 每次请求广告的工具表
+	lastToolMsg := map[int]string{} // 每次请求历史中最后一条 tool 消息
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []model.Message `json:"messages"`
+			Tools    []struct {
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		callN++
+		n := callN
+		for _, tool := range req.Tools {
+			toolNames[n] = append(toolNames[n], tool.Function.Name)
+		}
+		for _, m := range req.Messages {
+			if m.Role == "tool" {
+				lastToolMsg[n] = m.Content
+			}
+		}
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		var msg model.Message
+		switch n {
+		case 1, 3: // 两轮都要求掷骰子
+			msg = model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
+				ID: fmt.Sprintf("call_%d", n), Type: "function",
+				Function: model.ToolCallFunction{Name: "dice", Arguments: "{}"},
+			}}}
+		case 2:
+			msg = model.Message{Role: "assistant", Content: "first roll done"}
+		default:
+			msg = model.Message{Role: "assistant", Content: "second roll done"}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": msg}}})
+	}))
+	defer srv.Close()
+
+	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
+	args := []string{
+		"--api-key", "test",
+		"--base-url", srv.URL,
+		"--model", "m",
+		"--transcript", transcript,
+		"--tools-dir", toolsDir,
+	}
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	out := &syncBuffer{}
+	exit := make(chan int, 1)
+	go func() { exit <- run(args, inR, out, func(string) string { return "" }) }()
+
+	write := func(s string) {
+		t.Helper()
+		if _, err := io.WriteString(inW, s); err != nil {
+			t.Fatalf("feed stdin: %v", err)
+		}
+	}
+	waitFor := func(what string) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for !out.Contains(what) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %q; output:\n%s", what, out.String())
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	write("roll\n")
+	waitFor("first roll done")
+	if !out.Contains("→ dice(") {
+		t.Fatalf("guest tool trace missing; output:\n%s", out.String())
+	}
+
+	// 对话进行中把 dice.wasm 重建为 v2；等热替换落定。
+	testutil.BuildGuest(t, "examples/guests/dice", dicePath, "v2")
+	waitFor("[guest] dice reloaded")
+
+	write("again\n")
+	waitFor("second roll done")
+	write("/quit\n")
+
+	select {
+	case code := <-exit:
+		if code != 0 {
+			t.Fatalf("exit code %d; output:\n%s", code, out.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("run did not exit; output:\n%s", out.String())
+	}
+
+	mu.Lock()
+	if !reflect.DeepEqual(toolNames[1], toolNames[3]) {
+		t.Fatalf("tool list changed across hot-swap: %v vs %v", toolNames[1], toolNames[3])
+	}
+	if !strings.Contains(strings.Join(toolNames[1], ","), "dice") {
+		t.Fatalf("guest tool not advertised: %v", toolNames[1])
+	}
+	if !strings.Contains(lastToolMsg[2], `"version":"v1"`) {
+		t.Fatalf("turn 1 tool result should be v1: %q", lastToolMsg[2])
+	}
+	if !strings.Contains(lastToolMsg[4], `"version":"v2"`) {
+		t.Fatalf("turn 2 tool result should be v2: %q", lastToolMsg[4])
+	}
+	mu.Unlock()
+
+	// 历史逐字：8 条消息、角色序、v1 结果在前 v2 在后。
+	f, err := os.Open(transcript)
+	if err != nil {
+		t.Fatalf("open transcript: %v", err)
+	}
+	defer f.Close()
+	var msgs []model.Message
+	dec := json.NewDecoder(f)
+	for dec.More() {
+		var m model.Message
+		if err := dec.Decode(&m); err != nil {
+			t.Fatalf("decode transcript: %v", err)
+		}
+		msgs = append(msgs, m)
+	}
+	if len(msgs) != 8 {
+		t.Fatalf("transcript messages: %d: %+v", len(msgs), msgs)
+	}
+	roles := make([]string, len(msgs))
+	for i, m := range msgs {
+		roles[i] = m.Role
+	}
+	wantRoles := []string{"user", "assistant", "tool", "assistant", "user", "assistant", "tool", "assistant"}
+	if !reflect.DeepEqual(roles, wantRoles) {
+		t.Fatalf("transcript roles: %v", roles)
+	}
+	if !strings.Contains(msgs[2].Content, `"version":"v1"`) || !strings.Contains(msgs[6].Content, `"version":"v2"`) {
+		t.Fatalf("transcript tool results: %q / %q", msgs[2].Content, msgs[6].Content)
 	}
 }

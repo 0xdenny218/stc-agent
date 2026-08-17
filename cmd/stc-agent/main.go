@@ -1,7 +1,8 @@
 // Command stc-agent is a minimal CLI chat agent where every capability is a
 // fiber, built on stc-go. M2: multi-turn tool calling — the loop fiber drives
 // [model → tool]* rounds against the static Go tool fibers (read_file,
-// write_file, shell); /tools and /help are command fibers.
+// write_file, shell); /tools and /help are command fibers. M3: every *.wasm
+// in --tools-dir is a guest tool fiber, hot-swapped in place on rebuild.
 package main
 
 import (
@@ -16,6 +17,7 @@ import (
 
 	"github.com/0xdenny218/stc-agent/internal/cli"
 	"github.com/0xdenny218/stc-agent/internal/config"
+	"github.com/0xdenny218/stc-agent/internal/guest"
 	"github.com/0xdenny218/stc-agent/internal/loop"
 	"github.com/0xdenny218/stc-agent/internal/model"
 	"github.com/0xdenny218/stc-agent/internal/session"
@@ -30,6 +32,7 @@ func main() {
 type options struct {
 	cfg        config.Config
 	transcript string
+	toolsDir   string
 }
 
 func defaultConfig() config.Config {
@@ -51,6 +54,7 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 		timeout    = fs.Duration("timeout", 0, "request timeout")
 		transcript = fs.String("transcript", "", "append a JSONL transcript to this path; an existing file is replayed")
 		resume     = fs.String("resume", "", "alias of --transcript: resume from this transcript file")
+		toolsDir   = fs.String("tools-dir", "tools.d", "directory of *.wasm guest tools (watched for hot-swap)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
@@ -100,7 +104,7 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if *resume != "" {
 		tp = *resume
 	}
-	return options{cfg: cfg, transcript: tp}, nil
+	return options{cfg: cfg, transcript: tp, toolsDir: *toolsDir}, nil
 }
 
 // fileConfig 是配置文件的子集（timeout 只走命令行）。
@@ -172,27 +176,56 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		tools.ReadFileComponent(),
 		tools.WriteFileComponent(),
 		tools.ShellComponent(cwd, 30*time.Second),
+		guest.RuntimeComponent(),
+	}
+	// guest 工具（spec D5）：tools-dir 里每个 *.wasm 一个工具 fiber，
+	// 热替换结果打到会话输出。坏 guest 的 fiber 装载失败 → 启动 fail-fast。
+	guestComps, err := guest.Components(opts.toolsDir, func(name string, err error) {
+		if err != nil {
+			fmt.Fprintf(stdout, "[guest] %s reload failed: %v\n", name, err)
+		} else {
+			fmt.Fprintf(stdout, "[guest] %s reloaded\n", name)
+		}
+	})
+	if err != nil {
+		fmt.Fprintf(stdout, "error: %v\n", err)
+		return 2
+	}
+	comps = append(comps, guestComps...)
+	comps = append(comps,
 		loop.Component(10),
 		cli.ModelCommandComponent(),
 		cli.ToolsCommandComponent(),
 		cli.HelpCommandComponent(),
-		cli.Component(console),
-	}
-	fibers := make([]*stc.Fiber, 0, len(comps))
+	)
+	fibers := make([]*stc.Fiber, 0, len(comps)+1)
 	for _, c := range comps {
 		fibers = append(fibers, root.Load(c))
 	}
 
 	boot, cancel := stdctx.WithTimeout(stdctx.Background(), 10*time.Second)
 	defer cancel()
-	for _, f := range fibers {
+	waitReady := func(f *stc.Fiber) bool {
 		if err := f.Ready(boot); err != nil {
 			fmt.Fprintf(stdout, "error: fiber %s: %v\n", f.Name(), err)
 			for _, g := range fibers {
 				fmt.Fprintf(stdout, "  %-10s %s\n", g.Name(), g.State())
 			}
+			return false
+		}
+		return true
+	}
+	for _, f := range fibers {
+		if !waitReady(f) {
 			return 1
 		}
+	}
+	// cli 最后装载：serve 始于其 Apply。先等全部能力 Ready（guest 工具
+	// 的 wasm 编译较慢），第一轮对话才能看到完整的工具表。
+	cliFiber := root.Load(cli.Component(console))
+	fibers = append(fibers, cliFiber)
+	if !waitReady(cliFiber) {
+		return 1
 	}
 
 	<-console.Done()

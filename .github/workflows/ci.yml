@@ -12,6 +12,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # guest 工具测试（internal/guest、E2E 热替换）需要 TinyGo；
+      # 缺失时这些测试 Skip——CI 上必须真跑。
+      - name: Install TinyGo
+        run: |
+          curl -fsSL https://github.com/tinygo-org/tinygo/releases/download/v0.41.1/tinygo0.41.1.linux-amd64.tar.gz | sudo tar -xzf - -C /usr/local
+          echo "/usr/local/tinygo/bin" >> "$GITHUB_PATH"
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test -race -count=1 ./...
