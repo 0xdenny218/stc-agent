@@ -5,7 +5,33 @@
 **万物皆插件的最小 CLI 对话 agent**——基于
 [stc-go](https://github.com/0xdenny218/stc-go)（时空可组合性范式的 Go 实现）。
 
-> 状态：**M0 脚手架**。尚不可用——里程碑见下。
+> 状态：**M1 完成**——最小对话闭环可用：config/model/session/cli 四个
+> fiber + `/model` 级联 + JSONL transcript 可恢复。里程碑见下。
+
+## 用法
+
+```sh
+export DEEPSEEK_API_KEY=...   # 或 STC_AGENT_API_KEY / OPENAI_API_KEY
+go run ./cmd/stc-agent
+```
+
+配置优先级：内置默认 < 配置文件 < 环境变量 < 命令行。
+
+| 参数 | 环境变量 | 默认 |
+|---|---|---|
+| `--base-url` | `STC_AGENT_BASE_URL` | `https://api.deepseek.com` |
+| `--api-key` | `STC_AGENT_API_KEY`，再 `DEEPSEEK_API_KEY`，再 `OPENAI_API_KEY` | —（必填） |
+| `--model` | `STC_AGENT_MODEL` | `deepseek-chat` |
+| `--timeout` | — | `60s` |
+| `--transcript PATH` | — | JSONL transcript；文件已存在则 replay 恢复 |
+| `--resume PATH` | — | `--transcript` 的别名 |
+| `--config PATH` | — | `~/.config/stc-agent/config.json`（存在才读） |
+
+REPL 内命令：
+
+- `/model <name>`——对话中途换模型。config 服务被重提供，模型客户端与
+  REPL 反应式重载，而 session fiber（不依赖这两者）逐字保留历史。
+- `/quit`——退出。
 
 ## 是什么
 
@@ -28,8 +54,8 @@
 
 ## 里程碑
 
-- [ ] M0 脚手架（仓库、CI、双语 README、main 骨架）
-- [ ] M1 最小对话闭环（config/model/session/cli fiber，/model 级联）
+- [x] M0 脚手架（仓库、CI、双语 README、main 骨架）
+- [x] M1 最小对话闭环（config/model/session/cli fiber，/model 级联）
 - [ ] M2 工具系统 + agent 循环（toolset 稳定服务、静态 Go 工具）
 - [ ] M3 WASM guest 工具 + 热重载（hmr）：对话中途换工具
 - [ ] M4 发布 + 回流评审（哪些模式回流入 stc-go）
