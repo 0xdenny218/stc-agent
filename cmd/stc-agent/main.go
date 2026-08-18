@@ -12,6 +12,9 @@
 // servers as tool fibers (disconnect = tools vanish).
 // M9: sub-agent (child scopes), history compaction, todo, plan mode, and
 // background jobs (shell + sub-agent) converging on one lifecycle.
+// M10: the tool kit (edit/glob/grep, spill, session_title), web tools
+// (web_fetch/web_search, SSRF-guarded), and define_guest — the model writes
+// a Go guest tool that the host compiles with TinyGo and loads as a fiber.
 package main
 
 import (
@@ -28,6 +31,7 @@ import (
 	"github.com/0xdenny218/stc-agent/internal/approval"
 	"github.com/0xdenny218/stc-agent/internal/cli"
 	"github.com/0xdenny218/stc-agent/internal/config"
+	"github.com/0xdenny218/stc-agent/internal/define"
 	"github.com/0xdenny218/stc-agent/internal/guest"
 	"github.com/0xdenny218/stc-agent/internal/hooks"
 	"github.com/0xdenny218/stc-agent/internal/inspect"
@@ -43,6 +47,7 @@ import (
 	"github.com/0xdenny218/stc-agent/internal/task"
 	"github.com/0xdenny218/stc-agent/internal/todo"
 	"github.com/0xdenny218/stc-agent/internal/tools"
+	"github.com/0xdenny218/stc-agent/internal/web"
 	stc "github.com/0xdenny218/stc-go"
 )
 
@@ -56,6 +61,9 @@ type options struct {
 	transcript       string
 	toolsDir         string
 	skillsDir        string
+	spillDir         string
+	authoredDir      string
+	tinygo           string
 	mcpServers       []mcp.Server
 	compactThreshold int
 	print            string
@@ -82,6 +90,9 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 		resume     = fs.String("resume", "", "alias of --transcript: resume from this transcript file")
 		toolsDir   = fs.String("tools-dir", "tools.d", "directory of *.wasm guest tools (watched for hot-swap)")
 		skillsDir  = fs.String("skills-dir", "skills.d", "directory of skills (each <name>/SKILL.md hot-loads as a fiber)")
+		spillDir   = fs.String("spill-dir", "spill", "directory where the spill tool writes scratch files")
+		authored   = fs.String("authored-dir", "", "directory for model-authored guest tools (default <tools-dir>/authored)")
+		tinygoBin  = fs.String("tinygo", "", "tinygo executable for define_guest (default: from PATH)")
 		printShort = fs.String("p", "", "print mode: run a single turn non-interactively and exit")
 		printLong  = fs.String("print", "", "alias of -p")
 		allow      = fs.String("allow", "", "comma-separated tool names to auto-approve (\"*\" allows all)")
@@ -159,7 +170,13 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if *printLong != "" {
 		pp = *printLong
 	}
-	return options{cfg: cfg, policy: policy, transcript: tp, toolsDir: *toolsDir, skillsDir: *skillsDir, mcpServers: servers, compactThreshold: *compact, print: pp}, nil
+	// 自创作 guest 默认落在 <tools-dir>/authored：与手工摆放的 *.wasm
+	// （启动扫描）分开，避免重复装载与双重 hmr 监听。
+	ad := *authored
+	if ad == "" {
+		ad = filepath.Join(*toolsDir, "authored")
+	}
+	return options{cfg: cfg, policy: policy, transcript: tp, toolsDir: *toolsDir, skillsDir: *skillsDir, spillDir: *spillDir, authoredDir: ad, tinygo: *tinygoBin, mcpServers: servers, compactThreshold: *compact, print: pp}, nil
 }
 
 // funcValue 把单值回调适配成 flag.Value（--mcp 这类可重复旗标）。
@@ -284,6 +301,21 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		ia = interaction.Deny()
 	}
 
+	// M10 网络工具：SSRF 门默认开启；search 端点可经环境变量覆盖
+	// （换默认 DDG 之外的搜索后端）。
+	webOpts := web.Options{}
+	if v := getenv("STC_AGENT_WEB_SEARCH_URL"); v != "" {
+		webOpts.SearchURL = v
+	}
+	// guest 热替换上报（spec D5）：工具 fiber 与 define_guest 共用。
+	guestReload := func(name string, err error) {
+		if err != nil {
+			fmt.Fprintf(stdout, "[guest] %s reload failed: %v\n", name, err)
+		} else {
+			fmt.Fprintf(stdout, "[guest] %s reloaded\n", name)
+		}
+	}
+
 	// 装配列表（spec D2）：提供者在前，依赖由 inject 解析。
 	comps := []stc.Component{
 		ctlComp,
@@ -300,6 +332,17 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		tools.ShellComponent(cwd, 30*time.Second),
 		inspect.ToolComponent(),
 		guest.RuntimeComponent(),
+		// M10：工具包（edit/glob/grep、spill、session_title）+ 网络
+		// （web_fetch/web_search）+ 模型自创作 guest（define_guest，
+		// 宿主 TinyGo 编译为 wasm 后经 guest.Load 装载）。
+		tools.EditComponent(),
+		tools.GlobComponent(),
+		tools.GrepComponent(),
+		tools.SpillComponent(opts.spillDir),
+		tools.SessionTitleComponent(),
+		web.WebFetchComponent(webOpts),
+		web.WebSearchComponent(webOpts),
+		define.Component(define.Options{ToolsDir: opts.authoredDir, TinyGo: opts.tinygo, OnReload: guestReload}),
 		// M9：子 agent / todo / plan 模式 / 后台任务。
 		task.Component(task.Options{MaxTurns: 10}),
 		todo.Component(),
@@ -308,13 +351,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	}
 	// guest 工具（spec D5）：tools-dir 里每个 *.wasm 一个工具 fiber，
 	// 热替换结果打到会话输出。坏 guest 的 fiber 装载失败 → 启动 fail-fast。
-	guestComps, err := guest.Components(opts.toolsDir, func(name string, err error) {
-		if err != nil {
-			fmt.Fprintf(stdout, "[guest] %s reload failed: %v\n", name, err)
-		} else {
-			fmt.Fprintf(stdout, "[guest] %s reloaded\n", name)
-		}
-	})
+	guestComps, err := guest.Components(opts.toolsDir, guestReload)
 	if err != nil {
 		fmt.Fprintf(stdout, "error: %v\n", err)
 		return 2

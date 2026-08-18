@@ -33,6 +33,7 @@ const (
 	EventApproval   = "approval"   // 一次审批决定（spec D15）
 	EventTodo       = "todo"       // 一次 todo 全量快照（spec M9）
 	EventCompaction = "compaction" // 一次历史压缩（spec M9）
+	EventTitle      = "title"      // 一次会话标题设置（spec M10）
 )
 
 // Approval 是一次审批决定。只有询问类决定与硬性拒绝落日志：策略放行是
@@ -70,15 +71,17 @@ type Event struct {
 	Approval   *Approval      `json:"approval,omitempty"`
 	Todos      []Todo         `json:"todos,omitempty"`
 	Compaction *Compaction    `json:"compaction,omitempty"`
+	Title      string         `json:"title,omitempty"`
 }
 
-// Session 是事件日志 + 投影：events 是源，msgs/todos 是投影的缓存。
+// Session 是事件日志 + 投影：events 是源，msgs/todos/title 是投影的缓存。
 // 追加与关闭都走同一把锁。
 type Session struct {
 	mu        sync.Mutex
 	events    []Event
 	msgs      []model.Message
 	todos     []Todo
+	title     string
 	lastUsage *model.Usage
 	w         *bufio.Writer // nil = 纯内存
 	f         *os.File
@@ -110,6 +113,15 @@ func (s *Session) AddTodos(todos []Todo) error {
 // 内存投影，replay 时按同一规则重建。
 func (s *Session) AddCompaction(summary string) error {
 	return s.append(Event{Type: EventCompaction, Compaction: &Compaction{Summary: summary}})
+}
+
+// AddTitle 追加一条会话标题事件（spec M10）。标题须非空（会话标题不
+// 支持清空，replay 同样拒绝空标题行）。
+func (s *Session) AddTitle(title string) error {
+	if title == "" {
+		return errors.New("session: title must not be empty")
+	}
+	return s.append(Event{Type: EventTitle, Title: title})
 }
 
 func (s *Session) append(ev Event) error {
@@ -144,6 +156,8 @@ func (s *Session) project(ev Event) {
 		s.lastUsage = &u
 	case EventTodo:
 		s.todos = append([]Todo(nil), ev.Todos...)
+	case EventTitle:
+		s.title = ev.Title
 	case EventCompaction:
 		upto := ev.Compaction.Upto
 		if upto > len(s.msgs) {
@@ -166,6 +180,13 @@ func (s *Session) Todos() []Todo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Todo(nil), s.todos...)
+}
+
+// Title 返回会话标题（尚未设置则为空串）。
+func (s *Session) Title() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.title
 }
 
 // LastUsage 返回最近一次模型请求的用量（compaction 触发依据）；尚无
@@ -312,6 +333,11 @@ func parseEvent(raw json.RawMessage) (Event, error) {
 	case EventCompaction:
 		if ev.Compaction == nil || ev.Compaction.Summary == "" {
 			return Event{}, errors.New("compaction event without summary")
+		}
+		return ev, nil
+	case EventTitle:
+		if ev.Title == "" {
+			return Event{}, errors.New("title event without title")
 		}
 		return ev, nil
 	case "":

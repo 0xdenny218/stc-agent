@@ -131,7 +131,7 @@ func TestParseOptions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseOptions: %v", err)
 		}
-		if !reflect.DeepEqual(opts.policy.Allow, []string{"read_file", "inspect_agent"}) || len(opts.policy.Deny) != 0 {
+		if !reflect.DeepEqual(opts.policy.Allow, []string{"read_file", "inspect_agent", "glob", "grep"}) || len(opts.policy.Deny) != 0 {
 			t.Fatalf("default policy: %+v", opts.policy)
 		}
 	})
@@ -178,8 +178,8 @@ func readTranscript(t *testing.T, path string) (msgs []model.Message, usages []m
 			usages = append(usages, *ev.Usage)
 		case session.EventApproval:
 			approvals = append(approvals, *ev.Approval)
-		case session.EventTodo, session.EventCompaction:
-			// M9 事件：合法载荷，直接断言它们的测试自行读文件。
+		case session.EventTodo, session.EventCompaction, session.EventTitle:
+			// M9/M10 事件：合法载荷，直接断言它们的测试自行读文件。
 		default:
 			t.Fatalf("unknown event type %q", ev.Type)
 		}
@@ -346,7 +346,7 @@ func TestE2EToolCallLoop(t *testing.T) {
 		t.Fatalf("message counts per request: %d / %d (tool round-trip lost?)",
 			len(reqs[0].Messages), len(reqs[1].Messages))
 	}
-	if !reflect.DeepEqual(reqs[0].ToolNames, []string{"exit_plan_mode", "inspect_agent", "job_kill", "job_list", "job_start", "read_file", "shell", "task", "todo_write", "write_file"}) {
+	if !reflect.DeepEqual(reqs[0].ToolNames, []string{"define_guest", "edit", "exit_plan_mode", "glob", "grep", "inspect_agent", "job_kill", "job_list", "job_start", "read_file", "session_title", "shell", "spill", "task", "todo_write", "web_fetch", "web_search", "write_file"}) {
 		t.Fatalf("tools advertised: %v", reqs[0].ToolNames)
 	}
 	var toolMsg model.Message
@@ -429,7 +429,7 @@ func TestE2ESubagentTask(t *testing.T) {
 		}
 	}
 	if !reflect.DeepEqual(reqs[1].ToolNames,
-		[]string{"exit_plan_mode", "inspect_agent", "job_kill", "job_list", "job_start", "read_file", "shell", "todo_write", "write_file"}) {
+		[]string{"define_guest", "edit", "exit_plan_mode", "glob", "grep", "inspect_agent", "job_kill", "job_list", "job_start", "read_file", "session_title", "shell", "spill", "todo_write", "web_fetch", "web_search", "write_file"}) {
 		t.Fatalf("child tools: %v", reqs[1].ToolNames)
 	}
 	// 终答回流：父第三请求里的 tool 消息 = 子终答。
@@ -863,5 +863,104 @@ func TestE2EMCPToolCall(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(reqs[2].ToolNames, ","), "mcp__echo__echo") {
 		t.Fatalf("tool must vanish after server disconnect: %v", reqs[2].ToolNames)
+	}
+}
+
+// E2E/AuthoredGuestTool（spec M10 验收）：模型经 define_guest 写一份 Go
+// guest 源码，宿主用 TinyGo 编译成 wasm 并装载为普通工具；下一轮模型直接
+// 调用这个新工具，结果真实来自 wasm（非 mock）。断言 define 结果回灌、
+// echo 工具执行、源码与产物落在 authored 目录。需要 TinyGo（缺失即 Skip）。
+func TestE2EAuthoredGuestTool(t *testing.T) {
+	tg := testutil.TinygoPath(t) // 本地无 tinygo 则跳过；CI 有
+	authoredDir := t.TempDir()
+
+	// echoSource 提供 tool.echo，invoke 回显前缀（与 define 包单测同构）。
+	echoSource := `package main
+
+import "github.com/0xdenny218/stc-go/guest"
+
+func init() {
+	guest.OnInvoke(func(args string) string {
+		return "authored:" + args
+	})
+}
+
+//export start
+func start() {
+	_ = guest.Provide("tool.echo", ` + "`" + `{"name":"echo","description":"echo back","parameters":{"type":"object","properties":{}}}` + "`" + `)
+}
+
+func main() {}
+`
+	defineArgs, err := json.Marshal(map[string]string{"name": "echo", "source": echoSource})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := testutil.NewMockChat(func(n int, _ testutil.RecordedRequest) model.Message {
+		switch n {
+		case 1: // 模型写源码 → define_guest
+			return model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
+				ID: "call_d", Type: "function",
+				Function: model.ToolCallFunction{Name: "define_guest", Arguments: string(defineArgs)},
+			}}}
+		case 2: // 新工具已就位：直接调用它
+			return model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
+				ID: "call_e", Type: "function",
+				Function: model.ToolCallFunction{Name: "echo", Arguments: `{"hi":1}`},
+			}}}
+		default:
+			return model.Message{Role: "assistant", Content: "authored guest works"}
+		}
+	})
+	defer mock.Close()
+
+	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
+	write, waitFor, waitExit := serveIn(t, []string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "m",
+		"--transcript", transcript,
+		"--authored-dir", authoredDir,
+		"--tinygo", tg,
+		"--allow", "define_guest,echo", // M6 起二者默认要审批；本测试与审批策略无关
+	})
+
+	write("build a tool\n")
+	waitFor("authored guest works")
+	write("/quit\n")
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+
+	reqs := mock.Requests()
+	if len(reqs) != 3 {
+		t.Fatalf("requests: %d", len(reqs))
+	}
+	// 定义结果回灌：define_guest 真实执行（TinyGo 编译 + guest.Load）。
+	var defineResult string
+	for _, m := range reqs[1].Messages {
+		if m.Role == "tool" && m.ToolCallID == "call_d" {
+			defineResult = m.Content
+		}
+	}
+	if !strings.Contains(defineResult, `guest tool "echo" defined`) {
+		t.Fatalf("define_guest result must report the loaded guest: %q", defineResult)
+	}
+	// 新工具真实执行（wasm 调用，非 mock 代答）。
+	var echoResult string
+	for _, m := range reqs[2].Messages {
+		if m.Role == "tool" && m.ToolCallID == "call_e" {
+			echoResult = m.Content
+		}
+	}
+	if echoResult != `authored:{"hi":1}` {
+		t.Fatalf("echo tool result: %q", echoResult)
+	}
+	// 源码与产物落在 authored 目录。
+	if _, err := os.Stat(filepath.Join(authoredDir, "echo.go")); err != nil {
+		t.Fatalf("authored source missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(authoredDir, "echo.wasm")); err != nil {
+		t.Fatalf("authored wasm missing: %v", err)
 	}
 }

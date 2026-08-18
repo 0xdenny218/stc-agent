@@ -22,11 +22,12 @@ type Policy struct {
 	Deny  []string `json:"deny,omitempty"`
 }
 
-// DefaultPolicy 是内置默认（配置优先级的最底层）：read_file 与
-// inspect_agent 只读放行；其余一律询问——询问无门即拒绝，是为
-// fail-closed（spec D15）。
+// DefaultPolicy 是内置默认（配置优先级的最底层）：只读本地工具
+// （read_file / inspect_agent / glob / grep）直接放行；其余一律询问——
+// 询问无门即拒绝，是为 fail-closed（spec D15）。写工具（edit/spill）、
+// 远程工具（web_fetch/web_search）与 define_guest 均需人工过问。
 func DefaultPolicy() Policy {
-	return Policy{Allow: []string{"read_file", "inspect_agent"}}
+	return Policy{Allow: []string{"read_file", "inspect_agent", "glob", "grep"}}
 }
 
 func (p Policy) allows(name string) bool { return match(p.Allow, name) }

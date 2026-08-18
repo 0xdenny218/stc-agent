@@ -305,3 +305,69 @@ func TestTodoCompactionProjection(t *testing.T) {
 		t.Fatalf("replayed last usage: %+v, %v", u, ok)
 	}
 }
+
+// 会话标题事件（spec M10）：投影、事件日志、replay 恢复、空标题拒绝。
+func TestTitleEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chat.jsonl")
+	root := stc.New()
+	defer root.Close()
+	ctx, cancel := stdctx.WithTimeout(stdctx.Background(), 5*time.Second)
+	defer cancel()
+
+	fib := root.Load(Component(path))
+	if err := fib.Ready(ctx); err != nil {
+		t.Fatalf("session fiber: %v", err)
+	}
+	sess, err := stc.Service[*Session](root, KeySession)
+	if err != nil {
+		t.Fatalf("resolve session: %v", err)
+	}
+
+	if err := sess.AddTitle(""); err == nil {
+		t.Fatal("AddTitle with empty title must fail")
+	}
+	if got := sess.Title(); got != "" {
+		t.Fatalf("title before set: %q", got)
+	}
+
+	if err := sess.AddTitle("fix login bug"); err != nil {
+		t.Fatalf("AddTitle: %v", err)
+	}
+	if got := sess.Title(); got != "fix login bug" {
+		t.Fatalf("title: %q", got)
+	}
+	if err := sess.AddTitle("second title"); err != nil {
+		t.Fatalf("AddTitle: %v", err)
+	}
+	if got := sess.Title(); got != "second title" {
+		t.Fatalf("latest title: %q", got)
+	}
+
+	// 事件日志里有两条 title 事件（append-only，标题不折叠）。
+	var n int
+	for _, ev := range sess.Events() {
+		if ev.Type == EventTitle {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("title events in log: %d, want 2", n)
+	}
+
+	// replay 恢复最新标题。
+	fib.Dispose()
+	if err := fib.Gone(ctx); err != nil {
+		t.Fatalf("waiting session gone: %v", err)
+	}
+	fib2 := root.Load(Component(path))
+	if err := fib2.Ready(ctx); err != nil {
+		t.Fatalf("resume fiber: %v", err)
+	}
+	sess2, err := stc.Service[*Session](root, KeySession)
+	if err != nil {
+		t.Fatalf("resolve resumed session: %v", err)
+	}
+	if got := sess2.Title(); got != "second title" {
+		t.Fatalf("replayed title: %q", got)
+	}
+}
