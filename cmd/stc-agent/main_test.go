@@ -178,6 +178,8 @@ func readTranscript(t *testing.T, path string) (msgs []model.Message, usages []m
 			usages = append(usages, *ev.Usage)
 		case session.EventApproval:
 			approvals = append(approvals, *ev.Approval)
+		case session.EventTodo, session.EventCompaction:
+			// M9 事件：合法载荷，直接断言它们的测试自行读文件。
 		default:
 			t.Fatalf("unknown event type %q", ev.Type)
 		}
@@ -344,7 +346,7 @@ func TestE2EToolCallLoop(t *testing.T) {
 		t.Fatalf("message counts per request: %d / %d (tool round-trip lost?)",
 			len(reqs[0].Messages), len(reqs[1].Messages))
 	}
-	if !reflect.DeepEqual(reqs[0].ToolNames, []string{"inspect_agent", "read_file", "shell", "write_file"}) {
+	if !reflect.DeepEqual(reqs[0].ToolNames, []string{"exit_plan_mode", "inspect_agent", "job_kill", "job_list", "job_start", "read_file", "shell", "task", "todo_write", "write_file"}) {
 		t.Fatalf("tools advertised: %v", reqs[0].ToolNames)
 	}
 	var toolMsg model.Message
@@ -369,6 +371,81 @@ func TestE2EToolCallLoop(t *testing.T) {
 	}
 	if msgs[2].ToolCallID != "call_1" || !strings.Contains(msgs[2].Content, "hello-e2e") {
 		t.Fatalf("transcript tool message: %+v", msgs[2])
+	}
+}
+
+// E2E/SubagentTask（spec M9 验收）：父模型调 task 工具，子 agent 在子
+// 作用域用工具子集独立跑轮，终答以工具消息回流父会话事件。请求计数
+// 全局共享（父子同走一个 mock）：n1 父请求 → task 调用；n2 子请求 →
+// 终答；n3 父续轮 → 最终答复。
+func TestE2ESubagentTask(t *testing.T) {
+	mock := testutil.NewMockChat(func(n int, _ testutil.RecordedRequest) model.Message {
+		switch n {
+		case 1:
+			return model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
+				ID: "call_t", Type: "function",
+				Function: model.ToolCallFunction{
+					Name: "task", Arguments: `{"prompt":"count the widgets in the warehouse"}`,
+				},
+			}}}
+		case 2: // 子 agent 的独立一轮：直接给终答
+			return model.Message{Role: "assistant", Content: "child digest: 7 widgets"}
+		default:
+			return model.Message{Role: "assistant", Content: "parent done: warehouse counted"}
+		}
+	})
+	defer mock.Close()
+
+	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
+	write, waitFor, waitExit := serveIn(t, []string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "m",
+		"--transcript", transcript,
+		"--allow", "task",
+	})
+
+	write("delegate the count\n")
+	waitFor("parent done: warehouse counted")
+	write("/quit\n")
+
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code: %d", code)
+	}
+
+	reqs := mock.Requests()
+	if len(reqs) != 3 {
+		t.Fatalf("requests (parent + child + parent): %d", len(reqs))
+	}
+	// 子请求：全新会话——仅一条 user 消息（子 prompt），父历史不可见。
+	if len(reqs[1].Messages) != 1 || reqs[1].Messages[0].Role != "user" ||
+		reqs[1].Messages[0].Content != "count the widgets in the warehouse" {
+		t.Fatalf("child request messages: %+v", reqs[1].Messages)
+	}
+	// 子工具集：父工具去 task（不递归），其余照常可用。
+	for _, name := range reqs[1].ToolNames {
+		if name == "task" {
+			t.Fatalf("task must not recurse into the sub-agent: %v", reqs[1].ToolNames)
+		}
+	}
+	if !reflect.DeepEqual(reqs[1].ToolNames,
+		[]string{"exit_plan_mode", "inspect_agent", "job_kill", "job_list", "job_start", "read_file", "shell", "todo_write", "write_file"}) {
+		t.Fatalf("child tools: %v", reqs[1].ToolNames)
+	}
+	// 终答回流：父第三请求里的 tool 消息 = 子终答。
+	var toolMsg model.Message
+	for _, m := range reqs[2].Messages {
+		if m.Role == "tool" {
+			toolMsg = m
+		}
+	}
+	if toolMsg.ToolCallID != "call_t" || toolMsg.Content != "child digest: 7 widgets" {
+		t.Fatalf("child answer must flow back as tool result: %+v", toolMsg)
+	}
+
+	msgs, _, _ := readTranscript(t, transcript)
+	if len(msgs) != 4 || msgs[2].Role != "tool" || msgs[2].Content != "child digest: 7 widgets" {
+		t.Fatalf("transcript must carry the child answer as a tool message: %+v", msgs)
 	}
 }
 

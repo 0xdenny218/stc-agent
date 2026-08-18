@@ -212,3 +212,96 @@ func readTranscriptLines(t *testing.T, path string) []string {
 	}
 	return strings.Split(raw, "\n")
 }
+
+// Contract/CompactionProjection（spec M9 的前半）：todo 快照取最新、
+// compaction 按 upto 折叠消息、用量可追；replay 与实时追加走同一投影
+// 规则，终态逐字一致。
+func TestTodoCompactionProjection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chat.jsonl")
+	root := stc.New()
+	defer root.Close()
+	ctx, cancel := stdctx.WithTimeout(stdctx.Background(), 5*time.Second)
+	defer cancel()
+
+	fib := root.Load(Component(path))
+	if err := fib.Ready(ctx); err != nil {
+		t.Fatalf("session fiber: %v", err)
+	}
+	sess, err := stc.Service[*Session](root, KeySession)
+	if err != nil {
+		t.Fatalf("resolve session: %v", err)
+	}
+
+	for _, m := range []model.Message{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", Content: "a2"},
+	} {
+		_ = sess.Add(m)
+	}
+
+	// todo：全量快照，投影只留最新一份。
+	_ = sess.AddTodos([]Todo{{Content: "t1", Status: "pending"}})
+	_ = sess.AddTodos([]Todo{{Content: "t1", Status: "completed"}, {Content: "t2", Status: "pending"}})
+	if got := sess.Todos(); !reflect.DeepEqual(got, []Todo{{Content: "t1", Status: "completed"}, {Content: "t2", Status: "pending"}}) {
+		t.Fatalf("latest todos: %+v", got)
+	}
+
+	_ = sess.AddUsage(model.Usage{Model: "m", PromptTokens: 9000, CompletionTokens: 100, TotalTokens: 9100})
+	if u, ok := sess.LastUsage(); !ok || u.PromptTokens != 9000 {
+		t.Fatalf("last usage: %+v, %v", u, ok)
+	}
+
+	// compaction：当前 4 条消息折叠为摘要一条；之后的新消息接在摘要后。
+	_ = sess.AddCompaction("we discussed q1 and q2")
+	wantFolded := []model.Message{{Role: "user", Content: SummaryPrefix + "we discussed q1 and q2"}}
+	if got := sess.History(); !reflect.DeepEqual(got, wantFolded) {
+		t.Fatalf("folded history:\n got %+v\nwant %+v", got, wantFolded)
+	}
+	_ = sess.Add(model.Message{Role: "user", Content: "q3"})
+	wantTail := append(append([]model.Message(nil), wantFolded...), model.Message{Role: "user", Content: "q3"})
+	if got := sess.History(); !reflect.DeepEqual(got, wantTail) {
+		t.Fatalf("post-compaction history:\n got %+v\nwant %+v", got, wantTail)
+	}
+
+	// 日志里 todo 与 compaction 事件在场，upto = 折叠时的消息数。
+	var sawTodo, sawCompaction bool
+	for _, ev := range sess.Events() {
+		switch ev.Type {
+		case EventTodo:
+			sawTodo = true
+		case EventCompaction:
+			sawCompaction = true
+			if ev.Compaction.Upto != 4 {
+				t.Fatalf("compaction upto: %d, want 4", ev.Compaction.Upto)
+			}
+		}
+	}
+	if !sawTodo || !sawCompaction {
+		t.Fatalf("missing todo/compaction events")
+	}
+
+	// replay ≡ 内存终态（含折叠后的历史、最新 todo、最后用量）。
+	fib.Dispose()
+	if err := fib.Gone(ctx); err != nil {
+		t.Fatalf("waiting session gone: %v", err)
+	}
+	fib2 := root.Load(Component(path))
+	if err := fib2.Ready(ctx); err != nil {
+		t.Fatalf("resume fiber: %v", err)
+	}
+	sess2, err := stc.Service[*Session](root, KeySession)
+	if err != nil {
+		t.Fatalf("resolve resumed session: %v", err)
+	}
+	if got := sess2.History(); !reflect.DeepEqual(got, wantTail) {
+		t.Fatalf("replayed history:\n got %+v\nwant %+v", got, wantTail)
+	}
+	if got, want := sess2.Todos(), sess.Todos(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("replayed todos: %+v, want %+v", got, want)
+	}
+	if u, ok := sess2.LastUsage(); !ok || u.PromptTokens != 9000 {
+		t.Fatalf("replayed last usage: %+v, %v", u, ok)
+	}
+}

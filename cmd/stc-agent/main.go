@@ -10,6 +10,8 @@
 // segments, and an inspect_agent tool for self-description.
 // M8: skills (SKILL.md directories hot-loaded as fibers) and MCP stdio
 // servers as tool fibers (disconnect = tools vanish).
+// M9: sub-agent (child scopes), history compaction, todo, plan mode, and
+// background jobs (shell + sub-agent) converging on one lifecycle.
 package main
 
 import (
@@ -30,12 +32,16 @@ import (
 	"github.com/0xdenny218/stc-agent/internal/hooks"
 	"github.com/0xdenny218/stc-agent/internal/inspect"
 	"github.com/0xdenny218/stc-agent/internal/interaction"
+	"github.com/0xdenny218/stc-agent/internal/jobs"
 	"github.com/0xdenny218/stc-agent/internal/loop"
 	"github.com/0xdenny218/stc-agent/internal/mcp"
 	"github.com/0xdenny218/stc-agent/internal/model"
+	"github.com/0xdenny218/stc-agent/internal/plan"
 	"github.com/0xdenny218/stc-agent/internal/prompt"
 	"github.com/0xdenny218/stc-agent/internal/session"
 	"github.com/0xdenny218/stc-agent/internal/skills"
+	"github.com/0xdenny218/stc-agent/internal/task"
+	"github.com/0xdenny218/stc-agent/internal/todo"
 	"github.com/0xdenny218/stc-agent/internal/tools"
 	stc "github.com/0xdenny218/stc-go"
 )
@@ -45,13 +51,14 @@ func main() {
 }
 
 type options struct {
-	cfg        config.Config
-	policy     approval.Policy
-	transcript string
-	toolsDir   string
-	skillsDir  string
-	mcpServers []mcp.Server
-	print      string
+	cfg              config.Config
+	policy           approval.Policy
+	transcript       string
+	toolsDir         string
+	skillsDir        string
+	mcpServers       []mcp.Server
+	compactThreshold int
+	print            string
 }
 
 func defaultConfig() config.Config {
@@ -78,6 +85,7 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 		printShort = fs.String("p", "", "print mode: run a single turn non-interactively and exit")
 		printLong  = fs.String("print", "", "alias of -p")
 		allow      = fs.String("allow", "", "comma-separated tool names to auto-approve (\"*\" allows all)")
+		compact    = fs.Int("compact-threshold", 100000, "compact history when a turn's prompt tokens exceed this (0 disables)")
 		mcpSpecs   []string
 	)
 	fs.Var(funcValue(func(v string) error { mcpSpecs = append(mcpSpecs, v); return nil }),
@@ -151,7 +159,7 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if *printLong != "" {
 		pp = *printLong
 	}
-	return options{cfg: cfg, policy: policy, transcript: tp, toolsDir: *toolsDir, skillsDir: *skillsDir, mcpServers: servers, print: pp}, nil
+	return options{cfg: cfg, policy: policy, transcript: tp, toolsDir: *toolsDir, skillsDir: *skillsDir, mcpServers: servers, compactThreshold: *compact, print: pp}, nil
 }
 
 // funcValue 把单值回调适配成 flag.Value（--mcp 这类可重复旗标）。
@@ -292,6 +300,11 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		tools.ShellComponent(cwd, 30*time.Second),
 		inspect.ToolComponent(),
 		guest.RuntimeComponent(),
+		// M9：子 agent / todo / plan 模式 / 后台任务。
+		task.Component(task.Options{MaxTurns: 10}),
+		todo.Component(),
+		plan.Component(ia),
+		jobs.Component(jobs.Options{MaxTurns: 10}),
 	}
 	// guest 工具（spec D5）：tools-dir 里每个 *.wasm 一个工具 fiber，
 	// 热替换结果打到会话输出。坏 guest 的 fiber 装载失败 → 启动 fail-fast。
@@ -326,7 +339,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		}))
 	}
 	comps = append(comps,
-		loop.Component(10),
+		loop.Component(loop.Options{MaxTurns: 10, CompactThreshold: opts.compactThreshold}),
 		cli.ModelCommandComponent(),
 		cli.ToolsCommandComponent(),
 		cli.HelpCommandComponent(),

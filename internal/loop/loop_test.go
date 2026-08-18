@@ -19,10 +19,12 @@ import (
 )
 
 // stubChat 按队列应答并记录每次请求；内容经 onDelta 一次性"流"出，
-// 并附非零用量（断言用量事件的来源）。
+// 并附非零用量（断言用量事件的来源）。usages 队列非空时逐次弹出替代
+// 默认用量（compaction 触发断言需要可控的 prompt tokens）。
 type stubChat struct {
 	mu      sync.Mutex
 	replies []model.Message
+	usages  []model.Usage
 	reqs    []model.ChatRequest
 }
 
@@ -38,10 +40,12 @@ func (s *stubChat) Chat(_ stdctx.Context, req model.ChatRequest, onDelta func(st
 	if onDelta != nil && m.Content != "" {
 		onDelta(m.Content)
 	}
-	return &model.ChatResponse{
-		Message: m,
-		Usage:   model.Usage{Model: "stub", PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3},
-	}, nil
+	u := model.Usage{Model: "stub", PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3}
+	if len(s.usages) > 0 {
+		u = s.usages[0]
+		s.usages = s.usages[1:]
+	}
+	return &model.ChatResponse{Message: m, Usage: u}, nil
 }
 
 func (s *stubChat) Model() string { return "stub" }
@@ -461,5 +465,123 @@ func TestRunTurnSystemPrompt(t *testing.T) {
 		if m.Role == "system" {
 			t.Fatalf("system must stay out of history: %+v", sess.History())
 		}
+	}
+}
+
+// noticeStub 是可脚本化的后台通知源（jobs fiber 的桩）。
+type noticeStub struct {
+	mu    sync.Mutex
+	items []string
+}
+
+func (n *noticeStub) Drain() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := n.items
+	n.items = nil
+	return out
+}
+
+// Contract/NoticesDrain：后台完成通知在模型调用前作为 user 消息入历史
+// （尾部恒为 user/tool，线格式合法）；drain 空后不重复注入。
+func TestNoticesDrain(t *testing.T) {
+	sess := &session.Session{}
+	ts := registry.New[tools.Tool]()
+	chat := &stubChat{replies: []model.Message{
+		{Role: "assistant", Content: "one"},
+		{Role: "assistant", Content: "two"},
+	}}
+	r := newTestRunner(t, chat, sess, ts, allowGate{}, 5)
+	r.notices = &noticeStub{items: []string{"[job 1 done] output"}}
+
+	var out strings.Builder
+	if err := r.RunTurn(stdctx.Background(), "q1", &out); err != nil {
+		t.Fatalf("turn 1: %v", err)
+	}
+	if err := r.RunTurn(stdctx.Background(), "q2", &out); err != nil {
+		t.Fatalf("turn 2: %v", err)
+	}
+
+	hist := sess.History()
+	if len(hist) != 5 {
+		t.Fatalf("history: %+v", hist)
+	}
+	if hist[1].Role != "user" || hist[1].Content != "[job 1 done] output" {
+		t.Fatalf("notice must follow the input as a user message: %+v", hist)
+	}
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	if got := len(chat.reqs[1].Messages); got != 4 { // q1+notice+a1+q2，无重复注入
+		t.Fatalf("turn 2 request messages: %d: %+v", got, chat.reqs[1].Messages)
+	}
+}
+
+// Contract/Compaction（spec M9）：一轮结束后 prompt tokens 超阈 → 模型
+// 摘要当前历史，compaction 事件入日志、投影立即折叠；下一轮请求的
+// 历史从摘要开始（模型上下文低于阈值），低于阈值不再折叠。
+func TestCompaction(t *testing.T) {
+	sess := &session.Session{}
+	ts := registry.New[tools.Tool]()
+	chat := &stubChat{
+		replies: []model.Message{
+			{Role: "assistant", Content: "answer one"},
+			{Role: "assistant", Content: "SUMMARY"}, // 压缩调用的应答
+			{Role: "assistant", Content: "answer two"},
+		},
+		usages: []model.Usage{
+			{Model: "stub", PromptTokens: 9000, CompletionTokens: 10, TotalTokens: 9010}, // turn 1：超阈
+			{Model: "stub", PromptTokens: 9100, CompletionTokens: 50, TotalTokens: 9150}, // 压缩调用
+			{Model: "stub", PromptTokens: 60, CompletionTokens: 10, TotalTokens: 70},     // turn 2：低于阈值
+		},
+	}
+	r := newTestRunner(t, chat, sess, ts, allowGate{}, 5)
+	r.compact = 100
+
+	var out strings.Builder
+	if err := r.RunTurn(stdctx.Background(), "q1", &out); err != nil {
+		t.Fatalf("turn 1: %v", err)
+	}
+
+	// 摘要请求 = 当前历史 + 收尾指令。
+	chat.mu.Lock()
+	if len(chat.reqs) != 2 {
+		t.Fatalf("chat calls after turn 1: %d", len(chat.reqs))
+	}
+	sumReq := chat.reqs[1].Messages
+	chat.mu.Unlock()
+	if len(sumReq) != 3 || sumReq[2].Content != compactInstruction {
+		t.Fatalf("summarize request: %+v", sumReq)
+	}
+
+	// 投影折叠：历史 = 摘要一条；compaction 事件在场且 upto=2。
+	wantSummary := model.Message{Role: "user", Content: session.SummaryPrefix + "SUMMARY"}
+	if hist := sess.History(); len(hist) != 1 || hist[0].Role != wantSummary.Role || hist[0].Content != wantSummary.Content {
+		t.Fatalf("folded history: %+v", hist)
+	}
+	var found *session.Compaction
+	for _, ev := range sess.Events() {
+		if ev.Type == session.EventCompaction {
+			found = ev.Compaction
+		}
+	}
+	if found == nil || found.Upto != 2 || found.Summary != "SUMMARY" {
+		t.Fatalf("compaction event: %+v", found)
+	}
+	if !strings.Contains(out.String(), "[compacted 2 messages (prompt tokens 9000 > threshold 100)]") {
+		t.Fatalf("compaction notice missing: %q", out.String())
+	}
+
+	// 下一轮：模型上下文从摘要开始（低于阈值），不再触发折叠。
+	if err := r.RunTurn(stdctx.Background(), "q2", &out); err != nil {
+		t.Fatalf("turn 2: %v", err)
+	}
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	if len(chat.reqs) != 3 {
+		t.Fatalf("chat calls after turn 2: %d (no second compaction expected)", len(chat.reqs))
+	}
+	msgs := chat.reqs[2].Messages
+	if len(msgs) != 2 || msgs[0].Content != wantSummary.Content || msgs[1].Content != "q2" {
+		t.Fatalf("turn 2 context must start from the summary: %+v", msgs)
 	}
 }

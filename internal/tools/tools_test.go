@@ -71,7 +71,7 @@ func TestToolEffectExactness(t *testing.T) {
 		return f
 	}
 	load(tools.ToolsetComponent())
-	lf := load(loop.Component(3))
+	lf := load(loop.Component(loop.Options{MaxTurns: 3}))
 	cycle := lf.Context()
 
 	ts, err := stc.Service[*tools.Toolset](root, tools.KeyTools)

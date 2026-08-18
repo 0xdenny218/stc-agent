@@ -6,8 +6,8 @@
 [stc-go](https://github.com/0xdenny218/stc-go)（时空可组合性范式的 Go 实现）。
 
 > 状态：**v0.1.1 已发布**——`--tools-dir` 里的每个 `*.wasm` 都是 guest
-> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M8 完成（M8：
-> skills + MCP stdio 工具 fiber）；harness 化路线 M9–M10 见下。
+> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M9 完成（M9：
+> subagent + compaction + todos/plan/jobs）；harness 化路线 M10 见下。
 
 ## 安装
 
@@ -42,6 +42,7 @@ go run ./cmd/stc-agent -p "explain this repo"   # 一次性：打印答复后退
 | `--config PATH` | — | `~/.config/stc-agent/config.json`（存在才读） |
 | `-p, --print TEXT` | — | 非交互跑单轮：打印答复，exit 0 |
 | `--allow LIST` | — | 逗号分隔的免审批工具名（`*` = 全部）；追加进策略 |
+| `--compact-threshold N` | — | `100000`；一轮 prompt tokens 超过 N 即压缩历史（0 关闭） |
 
 在终端里 REPL 有 readline 行编辑与历史（stdin 是管道时退回普通逐行
 读取）。模型答复逐块流式呈现。Ctrl-C 中断当前轮而不杀会话（在提示符
@@ -52,6 +53,8 @@ REPL 内命令：
 - `/model <name>`——对话中途换模型。config 服务被重提供，模型客户端与
   REPL 反应式重载，而 session fiber（不依赖这两者）逐字保留历史。
 - `/tools`——列出已注册工具。
+- `/plan`——切换 plan 模式（在计划经 `exit_plan_mode` 批准前阻断非只读
+  工具）。
 - `/help`——列出命令。
 - `/quit`——退出。
 
@@ -65,6 +68,11 @@ REPL 内命令：
 - `shell`——`sh -c` 执行，30 秒超时，工作目录固定为启动目录。
 - `inspect_agent`——自描述：每个 fiber 的实时状态加上当前工具目录，
   JSON 格式。只读，默认策略放行。
+- `task`——派生子 agent 处理一条自包含指令，终答作为工具结果回流（M9）。
+- `todo_write`——维护任务清单，渲染进 system prompt（M9）。
+- `exit_plan_mode`——提出计划，获批后退出 plan 模式（M9）。
+- `job_start` / `job_list` / `job_kill`——后台 shell 命令或子 agent，
+  可列可杀（M9）。
 
 每次工具调用先过审批门再执行。默认策略自动放行 `read_file`，其余一律
 询问；策略可在配置文件里配（`{"approval": {"allow": [...], "deny": [...]}}`——
@@ -194,6 +202,33 @@ skill——也是一个 fiber。文件由可选 frontmatter（`name` /
 [`examples/mcp/echo`](examples/mcp/echo)。仅 stdio——MCP over
 HTTP/SSE 是不做项。
 
+## Subagent、compaction、todos、plan 模式、后台任务（M9）
+
+**Subagent**（`task` 工具）：模型把一条自包含子任务交给子 agent，子
+agent 在子作用域里独立跑轮（stc-go `Context.Child` + `Isolate`，spec
+D17）。子域共享模型与审批门，但在全新 realm 里拿到独立会话、工具表
+与轮次 runner——它的 provide 不与父域同键冲突，事件日志也不触碰父
+会话。子 agent 终答以普通工具消息回流进父 transcript。默认工具子集是
+全部去掉 `task`（不许递归）；`{"tools": [...]}` 可收窄。
+
+**Compaction**（`--compact-threshold`）：一轮的 prompt tokens 超过阈值
+时，loop 让模型把历史摘要成一条 `compaction` 事件；投影把被摘要段
+折叠，下一个请求从摘要开始。摘要自身的 token 用量也入账。
+
+**Todos**（`todo_write` 工具）：当前任务清单是一串 session 事件，渲染
+为 system prompt 里的实时段落（registry 同名覆盖即撤销/改写）。清空
+清单即摘除段落。
+
+**Plan 模式**（`/plan`、`exit_plan_mode`）：`/plan` 切换一个模式，在
+门禁处阻断所有非只读工具——先调研，再调 `exit_plan_mode` 提交计划。
+agent 请你批准：yes 关模式并把计划回灌，no 留在模式。每个决定像审批
+事件一样落日志。
+
+**后台任务**（`job_start` / `job_list` / `job_kill`）：启动一条 shell
+命令或子 agent 并立即返回；完成时以 user 消息进入下一次模型调用，
+`job_list` 枚举、`job_kill` 取消。shell 与子 agent 后台工作收敛到同
+一条生命周期（`task` 通路）。
+
 ## 是什么
 
 - CLI 对话 agent（stdin/stdout），带流式工具调用循环。
@@ -216,8 +251,9 @@ HTTP/SSE 是不做项。
   Cordis——把框架用透到全部要求的那个 agent，框架能力只经回流在上游
   生长。**agent 能力面**以
   [dsh](https://github.com/deepseek-ai/deepseek-harness) 为参照：
-  hooks、skills、MCP 已完成（M7–M8）；subagent、compaction 在路线图
-  上（M9）。
+  hooks、skills、MCP 已完成（M7–M8）；subagent、compaction、todos、
+  plan 模式与后台任务已完成（M9）；工具包与 agent 自创作 guest 工具在
+  路线图上（M10）。
 
 ## 里程碑
 
@@ -231,7 +267,8 @@ HTTP/SSE 是不做项。
 - [x] M7 hooks（通知 + 拦截）+ system-prompt 段落 + `inspect_agent` 自描述
 - [x] M8 skills（SKILL.md 目录热装载为 fiber：prompt 段落 + guest 工具）
   + MCP stdio server 工具 fiber（断开 = 工具失效）
-- [ ] M9 subagent + compaction + todos/plan/jobs
+- [x] M9 subagent（子作用域）+ compaction + todos + plan 模式 + 后台任务
+  （shell 与子 agent，同一条生命周期）
 - [ ] M10 工具包 + agent 自创作 guest 工具（评估）
 
 ## 开发

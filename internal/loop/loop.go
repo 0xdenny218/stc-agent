@@ -24,6 +24,18 @@ import (
 // KeyRunner 是轮次执行服务（REPL 的默认分发目标）。
 var KeyRunner = stc.NewKey[Runner]("runner")
 
+// KeyNotices 是异步通知服务（spec M9）：jobs 等后台来源把完成通知挂在
+// 这里，loop 在每次模型调用前 drain 成 user 消息入历史——只在调用前
+// drain，历史尾部此时必是 user/tool 消息，线格式恒合法。服务缺失 =
+// 没有后台来源，drain 跳过（可选依赖）。
+var KeyNotices = stc.NewKey[Notices]("loop.notices")
+
+// Notices 是后台完成通知的出口（jobs fiber 提供）。
+type Notices interface {
+	// Drain 取走全部待发通知（每条渲染为一则 user 消息文本）。
+	Drain() []string
+}
+
 type Runner interface {
 	RunTurn(ctx stdctx.Context, input string, w io.Writer) error
 }
@@ -35,6 +47,14 @@ func (e *MaxTurnsError) Error() string {
 	return fmt.Sprintf("agent: reached max tool turns (%d) without a final answer", e.Max)
 }
 
+// Options 是 loop fiber 的装配参数。
+type Options struct {
+	MaxTurns int // 单轮输入允许的最大工具迭代次数
+	// CompactThreshold：turn 结束后最近一次模型请求的 prompt tokens 超过
+	// 该阈值即压缩历史（摘要事件入日志，投影折叠；spec M9）。0 = 不压缩。
+	CompactThreshold int
+}
+
 type runner struct {
 	chat     model.ChatService
 	sess     *session.Session
@@ -43,12 +63,13 @@ type runner struct {
 	ic       *hooks.Interceptors
 	segments *prompt.Segments
 	fctx     *stc.Context // 周期 context：通知型事件的 Emit 端
+	notices  Notices      // nil = 无后台通知源
 	maxTurns int
+	compact  int
 }
 
-// Component 是 agent 循环 fiber。maxTurns 是单轮输入允许的最大工具
-// 迭代次数。
-func Component(maxTurns int) stc.Component {
+// Component 是 agent 循环 fiber。
+func Component(opts Options) stc.Component {
 	return stc.Component{
 		Name: "loop",
 		Inject: []stc.Key{model.KeyChat, session.KeySession, tools.KeyTools,
@@ -79,9 +100,12 @@ func Component(maxTurns int) stc.Component {
 			if err != nil {
 				return nil, err
 			}
+			// 可选依赖：没有 jobs fiber 时 notices 为 nil，drain 跳过。
+			notices, _ := stc.Service[Notices](c, KeyNotices)
 			if _, err := c.Provide(KeyRunner, &runner{
 				chat: chat, sess: sess, ts: ts, gate: gate,
-				ic: ic, segments: segments, fctx: c, maxTurns: maxTurns,
+				ic: ic, segments: segments, fctx: c,
+				notices: notices, maxTurns: opts.MaxTurns, compact: opts.CompactThreshold,
 			}); err != nil {
 				return nil, err
 			}
@@ -98,6 +122,13 @@ func Component(maxTurns int) stc.Component {
 // 的 tool_call 补一条 aborted 结果，保证历史线格式合法（assistant 的
 // tool_calls 必须各有对应 tool 消息）。
 func (r *runner) RunTurn(ctx stdctx.Context, input string, w io.Writer) (err error) {
+	// 可选依赖惰性解析：Apply 时 jobs fiber 可能尚未 provide（装载
+	// 异步）；REPL 在全部 fiber Ready 后才发轮，此处解析必然可见。
+	if r.notices == nil {
+		if n, err := stc.Service[Notices](r.fctx, KeyNotices); err == nil {
+			r.notices = n
+		}
+	}
 	hooks.Emit(r.fctx, hooks.TurnStart, hooks.Payload{Text: input})
 	var final string
 	defer func() {
@@ -111,6 +142,15 @@ func (r *runner) RunTurn(ctx stdctx.Context, input string, w io.Writer) (err err
 		return err
 	}
 	for range r.maxTurns {
+		// 后台完成通知只在模型调用前入历史（此时尾部必是 user/tool
+		// 消息，线格式恒合法）。
+		if r.notices != nil {
+			for _, n := range r.notices.Drain() {
+				if err := r.sess.Add(model.Message{Role: "user", Content: n}); err != nil {
+					return err
+				}
+			}
+		}
 		resp, err := r.chat.Chat(ctx, model.ChatRequest{
 			System:   prompt.Assemble(r.segments),
 			Messages: r.sess.History(),
@@ -129,6 +169,7 @@ func (r *runner) RunTurn(ctx stdctx.Context, input string, w io.Writer) (err err
 		if len(msg.ToolCalls) == 0 {
 			fmt.Fprintln(w) // 内容已流式打出，补收尾换行
 			final = msg.Content
+			r.maybeCompact(ctx, w)
 			return nil
 		}
 		if msg.Content != "" {
@@ -162,6 +203,44 @@ func (r *runner) fillUnanswered(tcs []model.ToolCall, content string) {
 	for _, tc := range tcs {
 		_ = r.sess.Add(toolResult(tc, content))
 	}
+}
+
+// compactInstruction 是摘要请求的收尾指令（spec M9：压缩是事件日志上的
+// 投影策略，摘要进 compaction 事件，被压缩段在 replay 时折叠）。
+const compactInstruction = "Summarize the conversation above in at most 500 words, preserving: the user's goals, decisions made, files and tools touched, and any pending tasks. Reply with the summary only."
+
+// maybeCompact 在一轮成功结束后检查：最近一次模型请求的 prompt tokens
+// 超过阈值即让模型摘要当前全部历史，compaction 事件入日志（投影立即
+// 折叠，下一个请求的历史从摘要开始）。压缩失败不炸已完成的轮次——只
+// 报告一行，下轮再试。
+func (r *runner) maybeCompact(ctx stdctx.Context, w io.Writer) {
+	if r.compact <= 0 {
+		return
+	}
+	u, ok := r.sess.LastUsage()
+	if !ok || u.PromptTokens <= r.compact {
+		return
+	}
+	history := r.sess.History()
+	if len(history) < 2 {
+		return // 空历史或只剩一条摘要，没有值得折叠的
+	}
+	req := model.ChatRequest{
+		Messages: append(append([]model.Message(nil), history...),
+			model.Message{Role: "user", Content: compactInstruction}),
+	}
+	resp, err := r.chat.Chat(ctx, req, func(string) {}) // 摘要不流向终端
+	if err != nil {
+		fmt.Fprintf(w, "[compaction failed: %v — will retry after the next turn]\n", err)
+		return
+	}
+	n := len(history)
+	if err := r.sess.AddCompaction(resp.Message.Content); err != nil {
+		fmt.Fprintf(w, "[compaction failed: %v]\n", err)
+		return
+	}
+	_ = r.sess.AddUsage(resp.Usage) // 摘要本身的成本也入账
+	fmt.Fprintf(w, "[compacted %d messages (prompt tokens %d > threshold %d)]\n", n, u.PromptTokens, r.compact)
 }
 
 // runTool 是工具执行管线（spec D15/D16）：pre = 拦截 hook（bail 即阻断）

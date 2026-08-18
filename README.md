@@ -8,8 +8,8 @@ spatiotemporal composability paradigm.
 
 > Status: **v0.1.1 released** — every `*.wasm` in `--tools-dir` is a guest
 > tool fiber, hot-swapped in place when you rebuild it, mid-conversation.
-> Milestones M0–M8 done (M8: skills + MCP stdio tool fibers);
-> the harness roadmap (M9–M10) is below.
+> Milestones M0–M9 done (M9: subagents + compaction + todos/plan/jobs);
+> the harness roadmap (M10) is below.
 
 ## Install
 
@@ -44,6 +44,7 @@ Config precedence: built-in defaults < config file < environment < flags.
 | `--config PATH` | — | `~/.config/stc-agent/config.json` if present |
 | `-p, --print TEXT` | — | run a single turn non-interactively, print the answer, exit 0 |
 | `--allow LIST` | — | comma-separated tool names to auto-approve (`*` = all); appended to the policy |
+| `--compact-threshold N` | — | `100000`; compact history when a turn's prompt tokens exceed N (0 disables) |
 
 On a terminal the REPL has readline line editing with history (plain line
 reads when stdin is piped). Model answers stream in as they arrive.
@@ -56,6 +57,8 @@ Commands inside the REPL:
   config service; the model client and REPL reload reactively, while the
   session fiber (which depends on neither) keeps the history verbatim.
 - `/tools` — list registered tools.
+- `/plan` — toggle plan mode (block non-read-only tools until the plan is
+  approved via `exit_plan_mode`).
 - `/help` — list commands.
 - `/quit` — exit.
 
@@ -71,6 +74,12 @@ extracted upstream, and this repo deleted its own copies):
 - `inspect_agent` — self-description: every fiber's live state plus the
   current tool catalog, as JSON. Read-only, auto-approved by the default
   policy.
+- `task` — spawn a sub-agent on a self-contained prompt; its final answer
+  flows back as the tool result (M9).
+- `todo_write` — maintain a task list rendered into the system prompt (M9).
+- `exit_plan_mode` — propose a plan and exit plan mode on approval (M9).
+- `job_start` / `job_list` / `job_kill` — background shell commands or
+  sub-agents, enumerable and killable (M9).
 
 Every tool call passes an approval gate before it runs. The default policy
 auto-approves `read_file` and asks about everything else; configure it in
@@ -213,6 +222,41 @@ removed`) and the next request simply doesn't advertise them. A minimal
 example server lives in [`examples/mcp/echo`](examples/mcp/echo). Stdio
 only — MCP over HTTP/SSE is a non-goal.
 
+## Sub-agents, compaction, todos, plan mode, background jobs (M9)
+
+**Sub-agents** (`task` tool): the model hands a self-contained subtask to a
+child agent that runs its own turns in a child scope (stc-go
+`Context.Child` + `Isolate`, spec D17). The child shares the model and
+approval gate but gets a fresh session, toolset and turn-runner in
+freshly-created realms — its provides never collide with the parent's and
+its event log never touches the parent's. The child's final answer flows
+back as an ordinary tool message into the parent's transcript. The default
+tool subset is everything except `task` (no recursion); `{"tools": [...]}`
+narrows it.
+
+**Compaction** (`--compact-threshold`): when a turn's prompt tokens exceed
+the threshold, the loop asks the model to summarize the history into a
+single `compaction` event; the projection folds the pre-summary messages
+away, so the next request starts from the summary. The summary's own token
+usage is logged too.
+
+**Todos** (`todo_write` tool): the current task list is a stream of session
+events, rendered into the system prompt as a live segment (the registry's
+same-name overwrite retracts/rewrites it). Emptying the list removes the
+segment.
+
+**Plan mode** (`/plan`, `exit_plan_mode`): `/plan` toggles a mode that
+blocks every non-read-only tool at the gate — research first, then call
+`exit_plan_mode` with the plan. The agent asks you to approve; yes turns
+the mode off and feeds the plan back, no keeps you in plan mode. Every
+decision is logged like an approval event.
+
+**Background jobs** (`job_start` / `job_list` / `job_kill`): start a shell
+command or a sub-agent on a self-contained prompt and return immediately;
+completion lands as a user message at the next model call, while
+`job_list` enumerates and `job_kill` cancels. Shell and sub-agent
+background work converge on one lifecycle (the `task` path).
+
 ## What it is
 
 - A CLI chat agent (stdin/stdout) with a streaming tool-calling loop.
@@ -237,8 +281,9 @@ only — MCP over HTTP/SSE is a non-goal.
   the agent that exercises the framework to its full requirements, so that
   framework capabilities grow upstream via reflux. Its **agent** capability
   set takes [dsh](https://github.com/deepseek-ai/deepseek-harness) as the
-  reference: hooks, skills and MCP are done (M7–M8); subagents and
-  compaction are on the roadmap (M9).
+  reference: hooks, skills and MCP are done (M7–M8); subagents, compaction,
+  todos, plan mode and background jobs are done (M9); the tool pack and
+  agent-authored guest tools are on the roadmap (M10).
 
 ## Milestones
 
@@ -256,7 +301,8 @@ only — MCP over HTTP/SSE is a non-goal.
 - [x] M8 skills (SKILL.md directories hot-load as fibers: prompt segment +
   guest tools) + MCP stdio servers as tool fibers (disconnect = tools
   vanish)
-- [ ] M9 subagents + compaction + todos/plan/jobs
+- [x] M9 subagents (child scopes) + compaction + todos + plan mode +
+  background jobs (shell and sub-agent, one lifecycle)
 - [ ] M10 tool pack + agent-authored guest tools (evaluation)
 
 ## Development
