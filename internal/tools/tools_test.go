@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xdenny218/stc-agent/internal/approval"
 	"github.com/0xdenny218/stc-agent/internal/loop"
 	"github.com/0xdenny218/stc-agent/internal/model"
 	"github.com/0xdenny218/stc-agent/internal/session"
@@ -26,6 +27,11 @@ func (stubChat) Chat(stdctx.Context, model.ChatRequest, func(string)) (*model.Ch
 
 func (stubChat) Model() string { return "stub" }
 
+// allowAllGate 是全放行审批门桩（本包测试与审批策略无关）。
+type allowAllGate struct{}
+
+func (allowAllGate) Check(stdctx.Context, model.ToolCall) error { return nil }
+
 // Contract/ToolEffectExactness：工具注册是可逆效应——fiber 装载/卸载后
 // 工具视图精确对应；且 toolset 是稳定注册表，工具增删不重载消费方
 // fiber（spec D3 + M2 验收：loop fiber 的周期 Context 指针不变）。
@@ -36,12 +42,15 @@ func TestToolEffectExactness(t *testing.T) {
 	ctx, cancel := stdctx.WithTimeout(stdctx.Background(), 5*time.Second)
 	defer cancel()
 
-	// loop 的另两个依赖以稳定桩提供，专注观察工具效应。
+	// loop 的另三个依赖以稳定桩提供，专注观察工具效应。
 	if _, err := root.Provide(model.KeyChat, stubChat{}); err != nil {
 		t.Fatalf("provide chat: %v", err)
 	}
 	if _, err := root.Provide(session.KeySession, &session.Session{}); err != nil {
 		t.Fatalf("provide session: %v", err)
+	}
+	if _, err := root.Provide(approval.KeyApprover, approval.Gate(allowAllGate{})); err != nil {
+		t.Fatalf("provide approval gate: %v", err)
 	}
 
 	load := func(c stc.Component) *stc.Fiber {

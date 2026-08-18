@@ -41,7 +41,7 @@ go build -o "$work/stc-agent" ./cmd/stc-agent
 # --- 启动 agent -----------------------------------------------------
 mkfifo "$work/stdin"
 "$work/stc-agent" --tools-dir "$work/tools.d" --transcript "$work/chat.jsonl" \
-	<"$work/stdin" >"$work/agent.log" 2>&1 &
+	--allow dice <"$work/stdin" >"$work/agent.log" 2>&1 &
 agent_pid=$!
 exec 3>"$work/stdin" # 持有写端：agent 不会因 stdin EOF 退出
 echo "==> agent started (pid $agent_pid)"

@@ -6,10 +6,10 @@
 [stc-go](https://github.com/0xdenny218/stc-go), the Go implementation of the
 spatiotemporal composability paradigm.
 
-> Status: **v0.1.0 released** — every `*.wasm` in `--tools-dir` is a guest
+> Status: **v0.1.1 released** — every `*.wasm` in `--tools-dir` is a guest
 > tool fiber, hot-swapped in place when you rebuild it, mid-conversation.
-> Milestones M0–M5 done (M5: event-log session spine + SSE streaming +
-> readline/`-p` terminal interaction); the harness roadmap (M6–M10) is below.
+> Milestones M0–M6 done (M6: tool pipeline + approval gate); the harness
+> roadmap (M7–M10) is below.
 
 ## Install
 
@@ -41,6 +41,7 @@ Config precedence: built-in defaults < config file < environment < flags.
 | `--tools-dir DIR` | — | `tools.d`; every `*.wasm` in it is a guest tool |
 | `--config PATH` | — | `~/.config/stc-agent/config.json` if present |
 | `-p, --print TEXT` | — | run a single turn non-interactively, print the answer, exit 0 |
+| `--allow LIST` | — | comma-separated tool names to auto-approve (`*` = all); appended to the policy |
 
 On a terminal the REPL has readline line editing with history (plain line
 reads when stdin is piped). Model answers stream in as they arrive.
@@ -64,17 +65,38 @@ extracted upstream, and this repo deleted its own copies):
 
 - `read_file` / `write_file` — filesystem access, 32 KiB output cap.
 - `shell` — `sh -c` with a 30s timeout, working directory pinned to the
-  launch directory. **There is no permission pipeline: the model can run
-  arbitrary commands as your user.** Run it only in directories you are
-  comfortable with.
+  launch directory.
+
+Every tool call passes an approval gate before it runs. The default policy
+auto-approves `read_file` and asks about everything else; configure it in
+the config file (`{"approval": {"allow": [...], "deny": [...]}}` — a file
+policy replaces the default) or with `--allow`. The deny list wins over the
+allow list; a tool matched by neither asks. A question suspends the turn
+mid-loop:
+
+```
+! allow "shell" to run?
+  {"command": "echo hi"}
+  [y] allow once  [n] deny  [a] always allow shell
+```
+
+`y` runs this one call; `n` feeds `error: denied by user` back to the model
+as the tool result (the turn continues); `a` auto-approves the tool for the
+rest of the session. With no interactive answer possible (`-p` headless
+mode) the gate is fail-closed: having to ask means denying. Every decision
+reached by asking — allow or deny — is appended to the transcript as an
+`approval` event with its source (`user` / `policy` / `fail-closed`);
+policy-allowed calls stay silent.
 
 A turn runs `[model → tool]*` until the model answers (the answer streams
 in chunk by chunk; tool calls are traced as `→ name(args)`), with a circuit
 breaker of 10 tool iterations. Tool
-failures are fed back to the model as result text, not turn-fatal errors; a
+failures and denials are fed back to the model as result text, not
+turn-fatal errors; a
 mid-turn reload fills unanswered tool calls with an aborted marker so the
 transcript stays wire-valid. The transcript is an append-only event log:
-messages, token usage per model call — the in-memory history is just a
+messages, token usage per model call, approval decisions — the in-memory
+history is just a
 projection of it, and resume replays the projection.
 
 ## Guest tools (WASM, hot-swapped mid-conversation)
@@ -167,8 +189,8 @@ behavior, not the registered name/description.
   the agent that exercises the framework to its full requirements, so that
   framework capabilities grow upstream via reflux. Its **agent** capability
   set takes [dsh](https://github.com/deepseek-ai/deepseek-harness) as the
-  reference: approvals, hooks, skills, MCP, subagents and compaction are on
-  the roadmap (M6–M9).
+  reference: hooks, skills, MCP, subagents and compaction are on
+  the roadmap (M7–M9).
 
 ## Milestones
 
@@ -179,7 +201,8 @@ behavior, not the registered name/description.
 - [x] M4 release + satellite-package review (v0.1.0 on GitHub; the review is filed as stc-go issues)
 - [x] M5 session spine (event log) + streaming + terminal interaction
   (readline, `-p` headless)
-- [ ] M6 tool pipeline + approval gate
+- [x] M6 tool pipeline + approval gate (policy + mid-turn question loop,
+  decisions logged as events)
 - [ ] M7 hooks + system-prompt assembly + agent self-inspection
 - [ ] M8 skills + MCP
 - [ ] M9 subagents + compaction + todos/plan/jobs

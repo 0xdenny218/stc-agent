@@ -5,10 +5,9 @@
 **万物皆插件的最小 CLI 对话 agent**——基于
 [stc-go](https://github.com/0xdenny218/stc-go)（时空可组合性范式的 Go 实现）。
 
-> 状态：**v0.1.0 已发布**——`--tools-dir` 里的每个 `*.wasm` 都是 guest
-> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M5 完成（M5：
-> 事件日志会话脊柱 + SSE 流式 + readline/`-p` 终端交互）；harness 化
-> 路线 M6–M10 见下。
+> 状态：**v0.1.1 已发布**——`--tools-dir` 里的每个 `*.wasm` 都是 guest
+> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M6 完成（M6：
+> 工具管线 + 审批门）；harness 化路线 M7–M10 见下。
 
 ## 安装
 
@@ -40,6 +39,7 @@ go run ./cmd/stc-agent -p "explain this repo"   # 一次性：打印答复后退
 | `--tools-dir DIR` | — | `tools.d`；其中每个 `*.wasm` 是一个 guest 工具 |
 | `--config PATH` | — | `~/.config/stc-agent/config.json`（存在才读） |
 | `-p, --print TEXT` | — | 非交互跑单轮：打印答复，exit 0 |
+| `--allow LIST` | — | 逗号分隔的免审批工具名（`*` = 全部）；追加进策略 |
 
 在终端里 REPL 有 readline 行编辑与历史（stdin 是管道时退回普通逐行
 读取）。模型答复逐块流式呈现。Ctrl-C 中断当前轮而不杀会话（在提示符
@@ -61,15 +61,31 @@ REPL 内命令：
 
 - `read_file` / `write_file`——文件读写，输出上限 32 KiB。
 - `shell`——`sh -c` 执行，30 秒超时，工作目录固定为启动目录。
-  **没有权限审批流：模型可以以你的身份执行任意命令。** 请只在你能接受
-  的目录里运行。
+
+每次工具调用先过审批门再执行。默认策略自动放行 `read_file`，其余一律
+询问；策略可在配置文件里配（`{"approval": {"allow": [...], "deny": [...]}}`——
+文件策略整体替换默认）或用 `--allow` 追加。deny 名单优先于 allow
+名单；两边都不命中的工具走询问。询问会把轮次挂起在工具循环中途：
+
+```
+! allow "shell" to run?
+  {"command": "echo hi"}
+  [y] allow once  [n] deny  [a] always allow shell
+```
+
+`y` 只放行这一次；`n` 把 `error: denied by user` 作为工具结果回灌给
+模型（轮次继续）；`a` 在本会话内对该工具免审批。无法交互作答时
+（`-p` headless 模式）门禁 fail-closed：问不了就拒绝。每个经询问得出
+的决定——批准或拒绝——都以 `approval` 事件追加进 transcript，并记录
+来源（`user` / `policy` / `fail-closed`）；策略放行的调用不产生事件。
 
 一轮输入按 `[模型 → 工具]*` 迭代直到模型给出答复（答复逐块流式呈现；
 工具调用以 `→ name(args)` 形式打印轨迹），熔断上限 10 次。工具失败
-作为结果文本回灌给模型自我纠正，而不是炸掉整轮；轮次中途发生重载时，
+与审批拒绝作为结果文本回灌给模型自我纠正，而不是炸掉整轮；轮次中途
+发生重载时，
 未应答的 tool_call 会补 aborted 标记，transcript 保持线格式合法。
 transcript 是 append-only 事件日志：消息、每次模型调用的 token
-用量——内存里的历史只是它的一个投影，resume 即重放投影。
+用量、审批决定——内存里的历史只是它的一个投影，resume 即重放投影。
 
 ## Guest 工具（WASM，对话进行中热替换）
 
@@ -156,8 +172,8 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
   之于 [stc-go](https://github.com/0xdenny218/stc-go) 正如 dsh 之于
   Cordis——把框架用透到全部要求的那个 agent，框架能力只经回流在上游
   生长。**agent 能力面**以
-  [dsh](https://github.com/deepseek-ai/deepseek-harness) 为参照：审批、
-  hooks、skills、MCP、subagent、compaction 在路线图上（M6–M9）。
+  [dsh](https://github.com/deepseek-ai/deepseek-harness) 为参照：
+  hooks、skills、MCP、subagent、compaction 在路线图上（M7–M9）。
 
 ## 里程碑
 
@@ -167,7 +183,7 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 - [x] M3 WASM guest 工具 + 热重载（hmr）：对话中途换工具
 - [x] M4 发布 + 回流评审（v0.1.0 已上 GitHub；评审产出为 stc-go issues）
 - [x] M5 会话脊柱（事件日志）+ 流式 + 终端交互（readline、`-p` headless）
-- [ ] M6 工具管线 + 审批门
+- [x] M6 工具管线 + 审批门（策略 + 途中提问回路，决定落事件日志）
 - [ ] M7 hooks + system-prompt 组装 + agent 自描述
 - [ ] M8 skills + MCP
 - [ ] M9 subagent + compaction + todos/plan/jobs

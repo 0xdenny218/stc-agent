@@ -103,6 +103,37 @@ func TestParseOptions(t *testing.T) {
 			t.Fatalf("file config: %+v", opts.cfg)
 		}
 	})
+
+	t.Run("approval policy", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(p, []byte(`{"approval":{"allow":["read_file","dice"],"deny":["shell"]}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		opts, err := parseOptions([]string{"--config", p}, env(nil))
+		if err != nil {
+			t.Fatalf("parseOptions: %v", err)
+		}
+		if !reflect.DeepEqual(opts.policy.Allow, []string{"read_file", "dice"}) ||
+			!reflect.DeepEqual(opts.policy.Deny, []string{"shell"}) {
+			t.Fatalf("file policy replaces default: %+v", opts.policy)
+		}
+
+		opts, err = parseOptions([]string{"--config", p, "--allow", "dice2,dice3"}, env(nil))
+		if err != nil {
+			t.Fatalf("parseOptions: %v", err)
+		}
+		if !reflect.DeepEqual(opts.policy.Allow, []string{"read_file", "dice", "dice2", "dice3"}) {
+			t.Fatalf("--allow appends to policy: %+v", opts.policy)
+		}
+
+		opts, err = parseOptions(nil, env(nil))
+		if err != nil {
+			t.Fatalf("parseOptions: %v", err)
+		}
+		if !reflect.DeepEqual(opts.policy.Allow, []string{"read_file"}) || len(opts.policy.Deny) != 0 {
+			t.Fatalf("default policy: %+v", opts.policy)
+		}
+	})
 }
 
 // syncBuffer 给 REPL goroutine 与断言共用一个输出缓冲。
@@ -125,8 +156,8 @@ func (s *syncBuffer) String() string {
 
 func (s *syncBuffer) Contains(sub string) bool { return strings.Contains(s.String(), sub) }
 
-// readTranscript 解码事件日志 transcript，返回消息投影与用量事件。
-func readTranscript(t *testing.T, path string) (msgs []model.Message, usages []model.Usage) {
+// readTranscript 解码事件日志 transcript，返回消息投影、用量与审批事件。
+func readTranscript(t *testing.T, path string) (msgs []model.Message, usages []model.Usage, approvals []session.Approval) {
 	t.Helper()
 	f, err := os.Open(path)
 	if err != nil {
@@ -144,11 +175,13 @@ func readTranscript(t *testing.T, path string) (msgs []model.Message, usages []m
 			msgs = append(msgs, *ev.Message)
 		case session.EventUsage:
 			usages = append(usages, *ev.Usage)
+		case session.EventApproval:
+			approvals = append(approvals, *ev.Approval)
 		default:
 			t.Fatalf("unknown event type %q", ev.Type)
 		}
 	}
-	return msgs, usages
+	return msgs, usages, approvals
 }
 
 // serveIn 启动 agent（脚本化 stdin），返回喂输入、等输出、等退出的助手。
@@ -236,7 +269,7 @@ func TestE2EModelSwitchKeepsHistory(t *testing.T) {
 		}
 	}
 
-	msgs, usages := readTranscript(t, transcript)
+	msgs, usages, _ := readTranscript(t, transcript)
 	want := []model.Message{
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "reply-from-alpha"},
@@ -323,7 +356,7 @@ func TestE2EToolCallLoop(t *testing.T) {
 		t.Fatalf("tool message in second request: %+v", toolMsg)
 	}
 
-	msgs, _ := readTranscript(t, transcript)
+	msgs, _, _ := readTranscript(t, transcript)
 	if len(msgs) != 4 {
 		t.Fatalf("transcript messages: %d: %+v", len(msgs), msgs)
 	}
@@ -374,7 +407,7 @@ func TestE2EStreamTurn(t *testing.T) {
 			t.Fatalf("line %d is not a typed event: %v", i+1, err)
 		}
 	}
-	msgs, usages := readTranscript(t, transcript)
+	msgs, usages, _ := readTranscript(t, transcript)
 	want := []model.Message{
 		{Role: "user", Content: "say hi"},
 		{Role: "assistant", Content: "streamed answer, assembled in order"},
@@ -410,7 +443,7 @@ func TestPrintMode(t *testing.T) {
 	if !out.Contains("one-shot answer") {
 		t.Fatalf("answer missing; output:\n%s", out.String())
 	}
-	msgs, usages := readTranscript(t, transcript)
+	msgs, usages, _ := readTranscript(t, transcript)
 	if len(msgs) != 2 || msgs[0].Role != "user" || msgs[1].Content != "one-shot answer" {
 		t.Fatalf("transcript: %+v", msgs)
 	}
@@ -448,6 +481,7 @@ func TestE2EHotSwapKeepsSession(t *testing.T) {
 		"--model", "m",
 		"--transcript", transcript,
 		"--tools-dir", toolsDir,
+		"--allow", "dice", // M6 起 guest 工具默认要审批；本测试与审批策略无关
 	})
 
 	write("roll\n")
@@ -493,7 +527,7 @@ func TestE2EHotSwapKeepsSession(t *testing.T) {
 	}
 
 	// 历史逐字：8 条消息、角色序、v1 结果在前 v2 在后。
-	msgs, _ := readTranscript(t, transcript)
+	msgs, _, _ := readTranscript(t, transcript)
 	if len(msgs) != 8 {
 		t.Fatalf("transcript messages: %d: %+v", len(msgs), msgs)
 	}
@@ -507,5 +541,110 @@ func TestE2EHotSwapKeepsSession(t *testing.T) {
 	}
 	if !strings.Contains(msgs[2].Content, `"version":"v1"`) || !strings.Contains(msgs[6].Content, `"version":"v2"`) {
 		t.Fatalf("transcript tool results: %q / %q", msgs[2].Content, msgs[6].Content)
+	}
+}
+
+// E2E/ApprovalGate（spec M6 验收）：默认策略下 write_file/shell 需批准、
+// read_file 直接放行。模型先调 write_file（用户拒）→ 拒绝回灌且工具不
+// 执行；再调 shell（用户准）→ 执行；两个决定都入事件日志；第二轮
+// read_file 无询问、无事件。
+func TestE2EApprovalGate(t *testing.T) {
+	dir := t.TempDir()
+	readTarget := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(readTarget, []byte("approval-e2e"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeTarget := filepath.Join(dir, "out.txt")
+
+	toolCall := func(id, name, args string) model.Message {
+		return model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
+			ID: id, Type: "function",
+			Function: model.ToolCallFunction{Name: name, Arguments: args},
+		}}}
+	}
+	mock := testutil.NewMockChat(func(n int, _ testutil.RecordedRequest) model.Message {
+		switch n {
+		case 1:
+			return toolCall("call_w", "write_file",
+				fmt.Sprintf(`{"path":%q,"content":"x"}`, writeTarget))
+		case 2: // write_file 被拒后改调 shell
+			return toolCall("call_s", "shell", `{"command":"echo ran"}`)
+		case 3:
+			return model.Message{Role: "assistant", Content: "gate turn done"}
+		case 4:
+			return toolCall("call_r", "read_file", fmt.Sprintf(`{"path":%q}`, readTarget))
+		default:
+			return model.Message{Role: "assistant", Content: "read turn done"}
+		}
+	})
+	defer mock.Close()
+
+	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
+	write, waitFor, waitExit := serveIn(t, []string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "m",
+		"--transcript", transcript,
+	})
+
+	write("create the file\n")
+	waitFor(`! allow "write_file" to run?`)
+	write("n\n") // 拒绝
+	waitFor(`! allow "shell" to run?`)
+	write("y\n") // 批准
+	waitFor("gate turn done")
+	write("read it back\n")
+	waitFor("read turn done")
+	write("/quit\n")
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+
+	// write_file 被拒绝 → 从未执行；shell 经批准执行，结果回灌。
+	if _, err := os.Stat(writeTarget); !os.IsNotExist(err) {
+		t.Fatalf("write_file executed despite denial")
+	}
+	reqs := mock.Requests()
+	if len(reqs) != 5 {
+		t.Fatalf("requests: %d", len(reqs))
+	}
+	var denial, shellResult string
+	for _, m := range reqs[1].Messages {
+		if m.Role == "tool" {
+			denial = m.Content
+		}
+	}
+	if !strings.Contains(denial, "denied by user") {
+		t.Fatalf("denial must feed back to the model: %q", denial)
+	}
+	for _, m := range reqs[2].Messages {
+		if m.Role == "tool" && m.ToolCallID == "call_s" {
+			shellResult = m.Content
+		}
+	}
+	if shellResult != "ran\n" {
+		t.Fatalf("approved shell should have run: %q", shellResult)
+	}
+
+	// 审批事件：恰两条——write_file deny/user、shell allow/user；
+	// read_file 直接放行（无询问、无事件），其工具结果照常回灌。
+	_, _, approvals := readTranscript(t, transcript)
+	if len(approvals) != 2 {
+		t.Fatalf("approval events: %+v", approvals)
+	}
+	if approvals[0].Tool != "write_file" || approvals[0].Decision != "deny" || approvals[0].Source != "user" {
+		t.Fatalf("first decision: %+v", approvals[0])
+	}
+	if approvals[1].Tool != "shell" || approvals[1].Decision != "allow" || approvals[1].Source != "user" {
+		t.Fatalf("second decision: %+v", approvals[1])
+	}
+	var readResult string
+	for _, m := range reqs[4].Messages {
+		if m.Role == "tool" && m.ToolCallID == "call_r" {
+			readResult = m.Content
+		}
+	}
+	if readResult != "approval-e2e" {
+		t.Fatalf("read_file should pass without asking: %q", readResult)
 	}
 }

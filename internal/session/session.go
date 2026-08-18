@@ -26,17 +26,28 @@ var KeySession = stc.NewKey[*Session]("session")
 var ErrClosed = errors.New("session: closed")
 
 // 事件类型。凡进入模型请求的内容都必须能由日志重建（"model-visible means
-// logged"）；未来的审批决定、compaction 摘要等都是新增事件类型。
+// logged"）；审批决定、compaction 摘要等都是新增事件类型。
 const (
-	EventMessage = "message" // 对话消息（user/assistant/tool）
-	EventUsage   = "usage"   // 一次模型请求的 token 用量
+	EventMessage  = "message"  // 对话消息（user/assistant/tool）
+	EventUsage    = "usage"    // 一次模型请求的 token 用量
+	EventApproval = "approval" // 一次审批决定（spec D15）
 )
+
+// Approval 是一次审批决定。只有询问类决定与硬性拒绝落日志：策略放行是
+// 静态默认路径，不产生事件（策略本身由配置可知，逐条记录只是噪声）。
+type Approval struct {
+	Tool      string `json:"tool"`
+	Arguments string `json:"arguments,omitempty"`
+	Decision  string `json:"decision"` // "allow" | "deny"
+	Source    string `json:"source"`   // "user" | "policy" | "fail-closed"
+}
 
 // Event 是事件日志的一行。同一事件只填与 Type 对应的载荷字段。
 type Event struct {
-	Type    string         `json:"type"`
-	Message *model.Message `json:"message,omitempty"`
-	Usage   *model.Usage   `json:"usage,omitempty"`
+	Type     string         `json:"type"`
+	Message  *model.Message `json:"message,omitempty"`
+	Usage    *model.Usage   `json:"usage,omitempty"`
+	Approval *Approval      `json:"approval,omitempty"`
 }
 
 // Session 是事件日志 + 投影：events 是源，msgs 是消息投影的缓存。
@@ -58,6 +69,11 @@ func (s *Session) Add(m model.Message) error {
 // AddUsage 追加一条 token 用量事件（每次模型请求一条）。
 func (s *Session) AddUsage(u model.Usage) error {
 	return s.append(Event{Type: EventUsage, Usage: &u})
+}
+
+// AddApproval 追加一条审批决定事件（spec D15：决定与来源可审计）。
+func (s *Session) AddApproval(a Approval) error {
+	return s.append(Event{Type: EventApproval, Approval: &a})
 }
 
 func (s *Session) append(ev Event) error {
@@ -102,6 +118,10 @@ func (s *Session) Events() []Event {
 		if ev.Usage != nil {
 			u := *ev.Usage
 			out[i].Usage = &u
+		}
+		if ev.Approval != nil {
+			a := *ev.Approval
+			out[i].Approval = &a
 		}
 	}
 	return out
@@ -202,6 +222,11 @@ func parseEvent(raw json.RawMessage) (Event, error) {
 	case EventUsage:
 		if ev.Usage == nil {
 			return Event{}, errors.New("usage event without usage")
+		}
+		return ev, nil
+	case EventApproval:
+		if ev.Approval == nil {
+			return Event{}, errors.New("approval event without approval")
 		}
 		return ev, nil
 	case "":

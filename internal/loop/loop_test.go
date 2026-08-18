@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/0xdenny218/stc-agent/internal/approval"
+	"github.com/0xdenny218/stc-agent/internal/interaction"
 	"github.com/0xdenny218/stc-agent/internal/model"
 	"github.com/0xdenny218/stc-agent/internal/session"
 	"github.com/0xdenny218/stc-agent/internal/tools"
@@ -42,6 +44,26 @@ func (s *stubChat) Chat(_ stdctx.Context, req model.ChatRequest, onDelta func(st
 
 func (s *stubChat) Model() string { return "stub" }
 
+// allowGate 是全放行审批门桩。
+type allowGate struct{}
+
+func (allowGate) Check(stdctx.Context, model.ToolCall) error { return nil }
+
+// denyGate 是对指定工具返回审批拒绝的桩。
+type denyGate struct{ tool, reason string }
+
+func (g denyGate) Check(_ stdctx.Context, tc model.ToolCall) error {
+	if tc.Function.Name == g.tool {
+		return &approval.DeniedError{Tool: g.tool, Reason: g.reason}
+	}
+	return nil
+}
+
+// abortGate 是在审批处中断轮次的桩（提问处 Ctrl-C）。
+type abortGate struct{}
+
+func (abortGate) Check(stdctx.Context, model.ToolCall) error { return interaction.ErrAborted }
+
 func fnCall(id, name, args string) model.ToolCall {
 	return model.ToolCall{ID: id, Type: "function", Function: model.ToolCallFunction{Name: name, Arguments: args}}
 }
@@ -66,7 +88,7 @@ func TestRunTurnToolCallLoop(t *testing.T) {
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c1", "echo", `{"x":1}`)}},
 		{Role: "assistant", Content: "done"},
 	}}
-	r := &runner{chat: chat, sess: sess, ts: ts, maxTurns: 5}
+	r := &runner{chat: chat, sess: sess, ts: ts, gate: allowGate{}, maxTurns: 5}
 
 	var out strings.Builder
 	if err := r.RunTurn(stdctx.Background(), "hi", &out); err != nil {
@@ -115,6 +137,93 @@ func TestRunTurnToolCallLoop(t *testing.T) {
 	}
 }
 
+// Contract/ToolPipelineApproval（spec D15 验收的一半）：审批拒绝归一化为
+// 工具结果回灌模型（被拒绝的工具不执行，同批其余工具照常执行）。
+func TestRunTurnApprovalDeniedFeedsBack(t *testing.T) {
+	sess := &session.Session{}
+	ts := registry.New[tools.Tool]()
+	ts.Register("rm", tools.Tool{
+		Name: "rm", Description: "never runs in this test",
+		Parameters: json.RawMessage(`{"type":"object"}`),
+		Invoke: func(stdctx.Context, json.RawMessage) (string, error) {
+			return "EXECUTED", nil
+		},
+	})
+	ts.Register("echo", echoTool())
+	chat := &stubChat{replies: []model.Message{
+		{Role: "assistant", ToolCalls: []model.ToolCall{
+			fnCall("c1", "rm", `{"path":"/x"}`),
+			fnCall("c2", "echo", `{"ok":true}`),
+		}},
+		{Role: "assistant", Content: "done"},
+	}}
+	r := &runner{chat: chat, sess: sess, ts: ts,
+		gate: denyGate{tool: "rm", reason: "denied by user"}, maxTurns: 5}
+
+	var out strings.Builder
+	if err := r.RunTurn(stdctx.Background(), "hi", &out); err != nil {
+		t.Fatalf("denial is not a turn error: %v", err)
+	}
+
+	hist := sess.History()
+	if len(hist) != 5 { // user + assistant + 2×tool + assistant
+		t.Fatalf("history length: %d: %+v", len(hist), hist)
+	}
+	if got := hist[2].Content; !strings.Contains(got, "denied by user") {
+		t.Fatalf("denial should feed back as tool result: %q", got)
+	}
+	if strings.Contains(hist[2].Content, "EXECUTED") {
+		t.Fatalf("denied tool must not execute: %q", hist[2].Content)
+	}
+	if got := hist[3].Content; got != `{"ok":true}` {
+		t.Fatalf("sibling tool unaffected: %q", got)
+	}
+
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	if len(chat.reqs) != 2 || chat.reqs[1].Messages[2].Content != hist[2].Content {
+		t.Fatalf("denial must reach the next model request: %+v", chat.reqs)
+	}
+}
+
+// Contract/ToolPipelineApproval 的另一半：审批提问处 Ctrl-C 是轮次级
+// 中断——RunTurn 原样上抛，当前与后续 tool_call 补中断标记（spec D15/M5
+// 取消安全的合并语义）。
+func TestRunTurnApprovalAbortInterrupts(t *testing.T) {
+	sess := &session.Session{}
+	ts := registry.New[tools.Tool]()
+	ts.Register("echo", echoTool())
+	chat := &stubChat{replies: []model.Message{
+		{Role: "assistant", ToolCalls: []model.ToolCall{
+			fnCall("c1", "echo", `{}`),
+			fnCall("c2", "echo", `{}`),
+		}},
+	}}
+	r := &runner{chat: chat, sess: sess, ts: ts, gate: abortGate{}, maxTurns: 5}
+
+	var out strings.Builder
+	err := r.RunTurn(stdctx.Background(), "hi", &out)
+	if !errors.Is(err, interaction.ErrAborted) {
+		t.Fatalf("want ErrAborted, got %v", err)
+	}
+
+	hist := sess.History()
+	if len(hist) != 4 { // user + assistant + 2×tool(中断标记)
+		t.Fatalf("history length: %d: %+v", len(hist), hist)
+	}
+	for _, m := range hist[2:] {
+		if m.Role != "tool" || !strings.Contains(m.Content, "turn interrupted") {
+			t.Fatalf("unanswered tool_calls must be filled: %+v", m)
+		}
+	}
+
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	if len(chat.reqs) != 1 {
+		t.Fatalf("turn interrupted before the follow-up request: %d", len(chat.reqs))
+	}
+}
+
 // Contract/MaxTurns：连续工具调用不收敛时熔断（spec M2 验收）。
 func TestRunTurnMaxTurns(t *testing.T) {
 	sess := &session.Session{}
@@ -125,7 +234,7 @@ func TestRunTurnMaxTurns(t *testing.T) {
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c2", "echo", `{}`)}},
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c3", "echo", `{}`)}},
 	}}
-	r := &runner{chat: chat, sess: sess, ts: ts, maxTurns: 3}
+	r := &runner{chat: chat, sess: sess, ts: ts, gate: allowGate{}, maxTurns: 3}
 
 	var out strings.Builder
 	err := r.RunTurn(stdctx.Background(), "spin", &out)
@@ -158,7 +267,7 @@ func TestRunTurnAbortFillsToolResults(t *testing.T) {
 	chat := &stubChat{replies: []model.Message{
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c1", "block", `{}`), fnCall("c2", "echo", `{}`)}},
 	}}
-	r := &runner{chat: chat, sess: sess, ts: ts, maxTurns: 5}
+	r := &runner{chat: chat, sess: sess, ts: ts, gate: allowGate{}, maxTurns: 5}
 
 	var out strings.Builder
 	err := r.RunTurn(ctx, "hi", &out)

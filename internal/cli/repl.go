@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/0xdenny218/stc-agent/internal/interaction"
 	"github.com/0xdenny218/stc-agent/internal/loop"
 	stc "github.com/0xdenny218/stc-go"
 	"github.com/peterh/liner"
@@ -29,7 +30,8 @@ type Console struct {
 	gate   chan struct{}
 	done   chan struct{}
 
-	doneOnce sync.Once
+	doneOnce  sync.Once
+	closeOnce sync.Once
 
 	mu         sync.Mutex
 	turnCancel stdctx.CancelFunc
@@ -147,11 +149,13 @@ func (c *Console) Done() <-chan struct{} { return c.done }
 
 func (c *Console) signalDone() { c.doneOnce.Do(func() { close(c.done) }) }
 
-// Close 释放终端状态（liner 恢复 termios）；程序退出前调用一次。
+// Close 释放终端状态（liner 恢复 termios）；幂等，程序退出前调用。
 func (c *Console) Close() {
-	if c.lnr != nil {
-		_ = c.lnr.Close()
-	}
+	c.closeOnce.Do(func() {
+		if c.lnr != nil {
+			_ = c.lnr.Close()
+		}
+	})
 }
 
 // Component 是 REPL fiber：inject runner（轮次执行）与 commands（命令分
@@ -231,8 +235,9 @@ func serve(ctx stdctx.Context, console *Console, r loop.Runner, reg *Registry, e
 				case err == nil:
 				case ctx.Err() != nil:
 					return // 周期被取消（级联重载）；新周期会接替
-				case turnCtx.Err() != nil:
-					// Ctrl-C 中断当前轮：流式内容可能没有收尾换行。
+				case turnCtx.Err() != nil || errors.Is(err, interaction.ErrAborted):
+					// Ctrl-C 中断当前轮（轮次中或审批提问处）：流式内容
+					// 可能没有收尾换行。
 					fmt.Fprintln(w, "\n^C turn interrupted")
 				default:
 					fmt.Fprintf(w, "error: %v\n", err)

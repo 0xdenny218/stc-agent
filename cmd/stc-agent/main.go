@@ -3,6 +3,9 @@
 // [model → tool]* rounds against the static Go tool fibers (read_file,
 // write_file, shell); /tools and /help are command fibers. M3: every *.wasm
 // in --tools-dir is a guest tool fiber, hot-swapped in place on rebuild.
+// M5: the session is an event log, the model client is SSE-streaming, and
+// the terminal has readline plus a -p headless mode. M6: every tool call
+// passes an approval gate (policy + mid-turn question loop) before running.
 package main
 
 import (
@@ -13,11 +16,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/0xdenny218/stc-agent/internal/approval"
 	"github.com/0xdenny218/stc-agent/internal/cli"
 	"github.com/0xdenny218/stc-agent/internal/config"
 	"github.com/0xdenny218/stc-agent/internal/guest"
+	"github.com/0xdenny218/stc-agent/internal/interaction"
 	"github.com/0xdenny218/stc-agent/internal/loop"
 	"github.com/0xdenny218/stc-agent/internal/model"
 	"github.com/0xdenny218/stc-agent/internal/session"
@@ -31,6 +37,7 @@ func main() {
 
 type options struct {
 	cfg        config.Config
+	policy     approval.Policy
 	transcript string
 	toolsDir   string
 	print      string
@@ -58,12 +65,14 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 		toolsDir   = fs.String("tools-dir", "tools.d", "directory of *.wasm guest tools (watched for hot-swap)")
 		printShort = fs.String("p", "", "print mode: run a single turn non-interactively and exit")
 		printLong  = fs.String("print", "", "alias of -p")
+		allow      = fs.String("allow", "", "comma-separated tool names to auto-approve (\"*\" allows all)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
 	}
 
 	cfg := defaultConfig()
+	policy := approval.DefaultPolicy()
 
 	path := *configPath
 	if path == "" {
@@ -75,8 +84,12 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 		}
 	}
 	if path != "" {
-		if err := mergeFile(&cfg, path); err != nil {
+		filePolicy, err := mergeFile(&cfg, path)
+		if err != nil {
 			return options{}, err
+		}
+		if filePolicy != nil {
+			policy = *filePolicy
 		}
 	}
 
@@ -102,6 +115,9 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if *timeout != 0 {
 		cfg.Timeout = *timeout
 	}
+	if *allow != "" {
+		policy.Allow = append(policy.Allow, strings.Split(*allow, ",")...)
+	}
 
 	tp := *transcript
 	if *resume != "" {
@@ -111,24 +127,28 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if *printLong != "" {
 		pp = *printLong
 	}
-	return options{cfg: cfg, transcript: tp, toolsDir: *toolsDir, print: pp}, nil
+	return options{cfg: cfg, policy: policy, transcript: tp, toolsDir: *toolsDir, print: pp}, nil
 }
 
 // fileConfig 是配置文件的子集（timeout 只走命令行）。
 type fileConfig struct {
-	BaseURL string `json:"base_url"`
-	APIKey  string `json:"api_key"`
-	Model   string `json:"model"`
+	BaseURL  string           `json:"base_url"`
+	APIKey   string           `json:"api_key"`
+	Model    string           `json:"model"`
+	Approval *approval.Policy `json:"approval"`
 }
 
-func mergeFile(cfg *config.Config, path string) error {
+// mergeFile 把配置文件并入 cfg，返回文件携带的审批策略（无则 nil——
+// 策略不经 config.Config：它是启动期输入，与 transcript/toolsDir 同族，
+// 不随 /model 级联热换）。
+func mergeFile(cfg *config.Config, path string) (*approval.Policy, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read config file: %w", err)
+		return nil, fmt.Errorf("read config file: %w", err)
 	}
 	var fc fileConfig
 	if err := json.Unmarshal(b, &fc); err != nil {
-		return fmt.Errorf("parse config file %s: %w", path, err)
+		return nil, fmt.Errorf("parse config file %s: %w", path, err)
 	}
 	if fc.BaseURL != "" {
 		cfg.BaseURL = fc.BaseURL
@@ -139,7 +159,7 @@ func mergeFile(cfg *config.Config, path string) error {
 	if fc.Model != "" {
 		cfg.Model = fc.Model
 	}
-	return nil
+	return fc.Approval, nil
 }
 
 func firstNonEmpty(vs ...string) string {
@@ -172,11 +192,25 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		return 2
 	}
 
+	// 提问回路（spec D15/D18）：REPL 模式的终端通道提前创建，审批门与
+	// REPL 共享它；headless 一次性模式用 fail-closed provider（问不了
+	// 就拒绝）。
+	var console *cli.Console
+	var ia interaction.Service
+	if opts.print == "" {
+		console = cli.NewConsole(stdin, stdout)
+		defer console.Close()
+		ia = cli.TerminalInteraction(console)
+	} else {
+		ia = interaction.Deny()
+	}
+
 	// 装配列表（spec D2）：提供者在前，依赖由 inject 解析。
 	comps := []stc.Component{
 		ctlComp,
 		model.Component(),
 		session.Component(opts.transcript),
+		approval.Component(opts.policy, ia),
 		cli.RegistryComponent(),
 		tools.ToolsetComponent(),
 		tools.ReadFileComponent(),
@@ -243,15 +277,12 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 
 	// cli 最后装载：serve 始于其 Apply。先等全部能力 Ready（guest 工具
 	// 的 wasm 编译较慢），第一轮对话才能看到完整的工具表。
-	console := cli.NewConsole(stdin, stdout)
 	cliFiber := root.Load(cli.Component(console))
 	fibers = append(fibers, cliFiber)
 	if !waitReady(cliFiber) {
-		console.Close()
 		return 1
 	}
 
 	<-console.Done()
-	console.Close()
 	return 0
 }
