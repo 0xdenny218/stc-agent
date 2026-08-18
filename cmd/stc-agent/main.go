@@ -267,21 +267,16 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	boot, cancel := stdctx.WithTimeout(stdctx.Background(), 10*time.Second)
 	defer cancel()
 
-	// fiber 目录最先装载：config 换血与其余启动 fiber 都往里登记
-	// （inspect 工具的 fiber 视图来源）。
+	// fiber 目录最先装载（inspect 工具的 fiber 视图来源）：目录读 stc-go
+	// 注册表快照（stc-go#4），后续一切 fiber——启动装配、config 换血、
+	// skills 热装载、define_guest 的 invoke 期装载——自动入册可见。
 	dirFiber := root.Load(inspect.DirectoryComponent())
 	if err := dirFiber.Ready(boot); err != nil {
 		fmt.Fprintf(stdout, "error: fiber %s: %v\n", dirFiber.Name(), err)
 		return 1
 	}
-	dir, err := stc.Service[*inspect.Directory](root, inspect.KeyDirectory)
-	if err != nil {
-		fmt.Fprintf(stdout, "error: %v\n", err)
-		return 1
-	}
-	dir.Register(dirFiber)
 
-	_, ctlComp := config.NewControl(root, opts.cfg, dir.Register)
+	_, ctlComp := config.NewControl(root, opts.cfg)
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(stdout, "error: %v\n", err)
@@ -358,7 +353,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	}
 	comps = append(comps, guestComps...)
 	// skills（spec M8）：supervisor 监听 skills-dir，落盘即装、删除即卸。
-	comps = append(comps, skills.SupervisorComponent(root, opts.skillsDir, dir.Register,
+	comps = append(comps, skills.SupervisorComponent(root, opts.skillsDir,
 		func(name string, err error) {
 			fmt.Fprintf(stdout, "[skill] %s: %v\n", name, err)
 		},
@@ -383,9 +378,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	)
 	fibers := make([]*stc.Fiber, 0, len(comps)+1)
 	for _, c := range comps {
-		f := root.Load(c)
-		dir.Register(f) // 目录随启动装配登记；逆在进程退出时无意义，丢弃
-		fibers = append(fibers, f)
+		fibers = append(fibers, root.Load(c))
 	}
 
 	waitReady := func(f *stc.Fiber) bool {
@@ -421,7 +414,6 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	// cli 最后装载：serve 始于其 Apply。先等全部能力 Ready（guest 工具
 	// 的 wasm 编译较慢），第一轮对话才能看到完整的工具表。
 	cliFiber := root.Load(cli.Component(console))
-	dir.Register(cliFiber)
 	fibers = append(fibers, cliFiber)
 	if !waitReady(cliFiber) {
 		return 1

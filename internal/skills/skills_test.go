@@ -186,28 +186,32 @@ func TestSkillWithGuestTool(t *testing.T) {
 	}
 }
 
-// supervisor 热装载：落盘即装（段落出现 + fiber 入目录）、坏 skill 只
-// 上报不拖垮、删除即卸（段落消失 + fiber 摘目录）。
+// supervisor 热装载：落盘即装（段落出现 + fiber 入注册表）、坏 skill 只
+// 上报不拖垮、删除即卸（段落消失 + fiber 出注册表）。
 func TestSupervisorHotLoad(t *testing.T) {
 	root, segments, _ := setup(t)
 	dir := t.TempDir()
 
-	var tracked atomic.Int32
-	track := func(*stc.Fiber) stc.Inverse {
-		tracked.Add(1)
-		return func() error { tracked.Add(-1); return nil }
+	// skill fiber 的可见性经 stc-go 注册表枚举观察（stc-go#4）。
+	inTree := func(name string) bool {
+		for _, f := range root.Fibers() {
+			if f.Name() == "skill:"+name {
+				return true
+			}
+		}
+		return false
 	}
 	errCh := make(chan error, 4)
-	sup := root.Load(skills.SupervisorComponent(root, dir, track, func(name string, err error) {
+	sup := root.Load(skills.SupervisorComponent(root, dir, func(name string, err error) {
 		errCh <- err
 	}, nil))
 	ready(t, sup)
 
-	// 落盘一个好 skill → 段落出现、fiber 登记。
+	// 落盘一个好 skill → 段落出现、fiber 入册。
 	writeSkill(t, dir, "greeter", "Be friendly.")
 	waitFor(t, "skill loaded after drop", func() bool {
 		_, ok := segments.Lookup("skill:greeter")
-		return ok && tracked.Load() == 1
+		return ok && inTree("greeter")
 	})
 
 	// 落盘一个坏 skill（空正文）→ onError 上报，supervisor 与好 skill 无恙。
@@ -224,12 +228,12 @@ func TestSupervisorHotLoad(t *testing.T) {
 		t.Fatalf("good skill unaffected: %q", got)
 	}
 
-	// 删除 skill 目录 → 段落消失、fiber 摘目录。
+	// 删除 skill 目录 → 段落消失、fiber 出册。
 	if err := os.RemoveAll(filepath.Join(dir, "greeter")); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "skill unloaded after delete", func() bool {
 		_, ok := segments.Lookup("skill:greeter")
-		return !ok && tracked.Load() == 0
+		return !ok && !inTree("greeter")
 	})
 }

@@ -17,7 +17,7 @@ func TestConfigCascade(t *testing.T) {
 	defer root.Close()
 
 	cfg := config.Config{BaseURL: "http://127.0.0.1", APIKey: "k", Model: "alpha", Timeout: time.Second}
-	ctl, ctlComp := config.NewControl(root, cfg, nil)
+	ctl, ctlComp := config.NewControl(root, cfg)
 	root.Load(ctlComp)
 	root.Load(model.Component())
 

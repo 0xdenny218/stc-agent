@@ -1,5 +1,5 @@
-github.com/0xdenny218/stc-go v0.4.0 h1:fD0B7eJp04Zpwy+6nZIMfw+yoZJxmFg91qZ3AusGwco=
-github.com/0xdenny218/stc-go v0.4.0/go.mod h1:PeQD3yNZrXa0nYlki1ib27e898VeaPJulVKp1F1bp1o=
+github.com/0xdenny218/stc-go v0.5.0 h1:M8mLV0LtyHAJNmcf4/joN2DHU6ORWLQG8gXyncWwYjs=
+github.com/0xdenny218/stc-go v0.5.0/go.mod h1:PeQD3yNZrXa0nYlki1ib27e898VeaPJulVKp1F1bp1o=
 github.com/fsnotify/fsnotify v1.10.1 h1:b0/UzAf9yR5rhf3RPm9gf3ehBPpf0oZKIjtpKrx59Ho=
 github.com/fsnotify/fsnotify v1.10.1/go.mod h1:TLheqan6HD6GBK6PrDWyDPBaEV8LspOxvPSjC+bVfgo=
 github.com/mattn/go-runewidth v0.0.3 h1:a+kO+98RDGEfo6asOGMmpodZq4FNtnGP54yps8BzLR4=

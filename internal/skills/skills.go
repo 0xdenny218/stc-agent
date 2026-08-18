@@ -209,10 +209,10 @@ func watchSkill(dir string, fw *fsnotify.Watcher, done chan struct{}, reload, go
 // SupervisorComponent 监听 skills-dir：含 SKILL.md 的子目录出现即装载
 // skill fiber，消失（目录删除 / SKILL.md 删除）即撤退。root 用于装载
 // ——与 config.Control 同构：动态 fiber 的生死由 supervisor 显式管理，
-// 不靠级联。track 把每个 skill fiber 登记进 inspect 目录（nil 跳过）；
+// 不靠级联。skill fiber 经注册表枚举天然对 inspect 可见（stc-go#4）；
 // onError 上报运行期装载失败（坏 skill 不拖垮 supervisor，nil 丢弃）；
 // onChange 在 skill 装载完成/撤退后上报（nil 丢弃）。
-func SupervisorComponent(root *stc.Context, dir string, track func(*stc.Fiber) stc.Inverse, onError func(name string, err error), onChange func(name string, loaded bool)) stc.Component {
+func SupervisorComponent(root *stc.Context, dir string, onError func(name string, err error), onChange func(name string, loaded bool)) stc.Component {
 	return stc.Component{
 		Name: "skills",
 		Apply: func(c *stc.Context) (stc.Inverse, error) {
@@ -230,7 +230,6 @@ func SupervisorComponent(root *stc.Context, dir string, track func(*stc.Fiber) s
 			s := &supervisor{
 				root:     root,
 				dir:      dir,
-				track:    track,
 				onError:  onError,
 				onChange: onChange,
 				loaded:   map[string]*skillEntry{},
@@ -251,15 +250,13 @@ func SupervisorComponent(root *stc.Context, dir string, track func(*stc.Fiber) s
 }
 
 type skillEntry struct {
-	fib     *stc.Fiber
-	untrack stc.Inverse
-	ready   bool // 装载完成（onChange(true) 已报）
+	fib   *stc.Fiber
+	ready bool // 装载完成（onChange(true) 已报）
 }
 
 type supervisor struct {
 	root     *stc.Context
 	dir      string
-	track    func(*stc.Fiber) stc.Inverse
 	onError  func(string, error)
 	onChange func(string, bool)
 
@@ -304,9 +301,6 @@ func (s *supervisor) load(name string, boot bool) error {
 		}
 	}))
 	e := &skillEntry{fib: f}
-	if s.track != nil {
-		e.untrack = s.track(f)
-	}
 	s.loaded[name] = e
 	s.mu.Unlock()
 
@@ -350,7 +344,7 @@ func (s *supervisor) load(name string, boot bool) error {
 	return nil
 }
 
-// remove 撤退一个 skill fiber：Dispose → Gone → 摘目录。幂等。
+// remove 撤退一个 skill fiber：Dispose → Gone。幂等。
 func (s *supervisor) remove(name string) {
 	s.mu.Lock()
 	e, ok := s.loaded[name]
@@ -365,9 +359,6 @@ func (s *supervisor) remove(name string) {
 	ctx, cancel := stdctx.WithTimeout(stdctx.Background(), 5*time.Second)
 	defer cancel()
 	_ = e.fib.Gone(ctx)
-	if e.untrack != nil {
-		_ = e.untrack()
-	}
 	if e.ready && s.onChange != nil {
 		s.onChange(name, false)
 	}

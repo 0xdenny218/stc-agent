@@ -63,7 +63,8 @@ func toolNames(rep report) []string {
 }
 
 // Contract/Inspect（spec M7 验收）：inspect 报告的 fiber 状态/工具目录
-// 与实际一致——工具卸载后从目录消失，fiber 摘除后从报告消失。
+// 与实际一致——fiber 目录直接读 stc-go 注册表快照（stc-go#4）：装载即
+// 入册（无需登记）、卸载（Gone）即从报告消失。
 func TestInspect(t *testing.T) {
 	root := stc.New()
 	defer root.Close()
@@ -81,14 +82,15 @@ func TestInspect(t *testing.T) {
 		t.Fatalf("resolve toolset: %v", err)
 	}
 
-	// 目录初始为空：装配方还没登记。
-	if got := dir.Snapshot(); len(got) != 0 {
-		t.Fatalf("directory starts empty: %+v", got)
+	// 目录=全树注册表：已装载的三个 fiber（含目录与 inspect 工具自身）
+	// 全部可见，无需任何登记。
+	if got := fiberNames(report{Fibers: dir.Snapshot()}); len(got) != 3 ||
+		got["inspect-dir"] != "active" || got["tool:inspect_agent"] != "active" || got["toolset"] != "active" {
+		t.Fatalf("snapshot must list every loaded fiber: %+v", got)
 	}
 
+	// 装载 read_file（无登记调用）→ 出现在报告里。
 	rf := load(t, root, tools.ReadFileComponent())
-	unregister := dir.Register(rf)
-
 	rep := invokeInspect(t, ts)
 	names := fiberNames(rep)
 	if names["tool:read_file"] != "active" {
@@ -104,14 +106,13 @@ func TestInspect(t *testing.T) {
 		t.Fatalf("tool catalog must list read_file: %v", toolNames(rep))
 	}
 
-	// 工具 fiber 卸载 + 目录摘除 → 报告同步消失（目录与树一致靠装配方）。
+	// 工具 fiber 卸载（Gone 出册）→ 报告同步消失。
 	goneCtx, cancel := stdctx.WithTimeout(stdctx.Background(), 5*time.Second)
 	defer cancel()
 	rf.Dispose()
 	if err := rf.Gone(goneCtx); err != nil {
 		t.Fatalf("read_file gone: %v", err)
 	}
-	unregister()
 
 	rep = invokeInspect(t, ts)
 	for _, n := range toolNames(rep) {
@@ -122,9 +123,9 @@ func TestInspect(t *testing.T) {
 	if _, ok := fiberNames(rep)["tool:read_file"]; ok {
 		t.Fatalf("read_file fiber must vanish from directory: %+v", fiberNames(rep))
 	}
-	// 未登记的 fiber 不在目录里（目录只反映登记过的句柄）。
-	if _, ok := fiberNames(rep)["tool:inspect_agent"]; ok {
-		t.Fatalf("inspect_agent was never registered: %+v", fiberNames(rep))
+	// 其余 fiber 不受影响（出册的只是 read_file）。
+	if got := fiberNames(rep); len(got) != 3 {
+		t.Fatalf("remaining fibers: %+v", got)
 	}
 	if n := toolNames(rep); len(n) != 1 || n[0] != "inspect_agent" {
 		t.Fatalf("remaining tools: %v", n)
