@@ -6,8 +6,9 @@
 [stc-go](https://github.com/0xdenny218/stc-go)（时空可组合性范式的 Go 实现）。
 
 > 状态：**v0.1.0 已发布**——`--tools-dir` 里的每个 `*.wasm` 都是 guest
-> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M4 完成；
-> harness 化路线 M5–M10 见下。
+> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M5 完成（M5：
+> 事件日志会话脊柱 + SSE 流式 + readline/`-p` 终端交互）；harness 化
+> 路线 M6–M10 见下。
 
 ## 安装
 
@@ -22,7 +23,8 @@ go install github.com/0xdenny218/stc-agent/cmd/stc-agent@latest
 
 ```sh
 export DEEPSEEK_API_KEY=...   # 或 STC_AGENT_API_KEY / OPENAI_API_KEY
-go run ./cmd/stc-agent
+go run ./cmd/stc-agent                          # 交互式 REPL
+go run ./cmd/stc-agent -p "explain this repo"   # 一次性：打印答复后退出
 ```
 
 配置优先级：内置默认 < 配置文件 < 环境变量 < 命令行。
@@ -33,10 +35,15 @@ go run ./cmd/stc-agent
 | `--api-key` | `STC_AGENT_API_KEY`，再 `DEEPSEEK_API_KEY`，再 `OPENAI_API_KEY` | —（必填） |
 | `--model` | `STC_AGENT_MODEL` | `deepseek-chat` |
 | `--timeout` | — | `60s` |
-| `--transcript PATH` | — | JSONL transcript；文件已存在则 replay 恢复 |
+| `--transcript PATH` | — | JSONL 事件日志（消息 + token 用量）；文件已存在则 replay 恢复 |
 | `--resume PATH` | — | `--transcript` 的别名 |
 | `--tools-dir DIR` | — | `tools.d`；其中每个 `*.wasm` 是一个 guest 工具 |
 | `--config PATH` | — | `~/.config/stc-agent/config.json`（存在才读） |
+| `-p, --print TEXT` | — | 非交互跑单轮：打印答复，exit 0 |
+
+在终端里 REPL 有 readline 行编辑与历史（stdin 是管道时退回普通逐行
+读取）。模型答复逐块流式呈现。Ctrl-C 中断当前轮而不杀会话（在提示符
+处则是丢弃当前行）；空行上 Ctrl-D 退出。
 
 REPL 内命令：
 
@@ -57,10 +64,12 @@ REPL 内命令：
   **没有权限审批流：模型可以以你的身份执行任意命令。** 请只在你能接受
   的目录里运行。
 
-一轮输入按 `[模型 → 工具]*` 迭代直到模型给出答复（工具调用以
-`→ name(args)` 形式打印轨迹），熔断上限 10 次。工具失败作为结果文本
-回灌给模型自我纠正，而不是炸掉整轮；轮次中途发生重载时，未应答的
-tool_call 会补 aborted 标记，transcript 保持线格式合法。
+一轮输入按 `[模型 → 工具]*` 迭代直到模型给出答复（答复逐块流式呈现；
+工具调用以 `→ name(args)` 形式打印轨迹），熔断上限 10 次。工具失败
+作为结果文本回灌给模型自我纠正，而不是炸掉整轮；轮次中途发生重载时，
+未应答的 tool_call 会补 aborted 标记，transcript 保持线格式合法。
+transcript 是 append-only 事件日志：消息、每次模型调用的 token
+用量——内存里的历史只是它的一个投影，resume 即重放投影。
 
 ## Guest 工具（WASM，对话进行中热替换）
 
@@ -129,7 +138,7 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 
 ## 是什么
 
-- CLI 对话 agent（stdin/stdout），带工具调用循环。
+- CLI 对话 agent（stdin/stdout），带流式工具调用循环。
 - 每个能力都是 fiber：模型客户端、工具、斜杠命令、会话、REPL 本身。
   装配完全由范式机制（`Load`/`Provide`/`Inject`/`Effect`）承载，
   `main` 只负责列出组件清单。
@@ -147,8 +156,8 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
   之于 [stc-go](https://github.com/0xdenny218/stc-go) 正如 dsh 之于
   Cordis——把框架用透到全部要求的那个 agent，框架能力只经回流在上游
   生长。**agent 能力面**以
-  [dsh](https://github.com/deepseek-ai/deepseek-harness) 为参照：流式、
-  审批、hooks、skills、MCP、subagent、compaction 在路线图上（M5–M9）。
+  [dsh](https://github.com/deepseek-ai/deepseek-harness) 为参照：审批、
+  hooks、skills、MCP、subagent、compaction 在路线图上（M6–M9）。
 
 ## 里程碑
 
@@ -157,7 +166,7 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 - [x] M2 工具系统 + agent 循环（toolset 稳定服务、静态 Go 工具）
 - [x] M3 WASM guest 工具 + 热重载（hmr）：对话中途换工具
 - [x] M4 发布 + 回流评审（v0.1.0 已上 GitHub；评审产出为 stc-go issues）
-- [ ] M5 会话脊柱（事件日志）+ 流式 + 终端交互（readline、`-p` headless）
+- [x] M5 会话脊柱（事件日志）+ 流式 + 终端交互（readline、`-p` headless）
 - [ ] M6 工具管线 + 审批门
 - [ ] M7 hooks + system-prompt 组装 + agent 自描述
 - [ ] M8 skills + MCP

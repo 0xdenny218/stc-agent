@@ -14,14 +14,15 @@ import (
 	"github.com/0xdenny218/stc-go/registry"
 )
 
-// stubChat 按队列应答并记录每次请求。
+// stubChat 按队列应答并记录每次请求；内容经 onDelta 一次性"流"出，
+// 并附非零用量（断言用量事件的来源）。
 type stubChat struct {
 	mu      sync.Mutex
 	replies []model.Message
 	reqs    []model.ChatRequest
 }
 
-func (s *stubChat) Chat(_ stdctx.Context, req model.ChatRequest) (*model.ChatResponse, error) {
+func (s *stubChat) Chat(_ stdctx.Context, req model.ChatRequest, onDelta func(string)) (*model.ChatResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reqs = append(s.reqs, req)
@@ -30,7 +31,13 @@ func (s *stubChat) Chat(_ stdctx.Context, req model.ChatRequest) (*model.ChatRes
 	}
 	m := s.replies[0]
 	s.replies = s.replies[1:]
-	return &model.ChatResponse{Message: m}, nil
+	if onDelta != nil && m.Content != "" {
+		onDelta(m.Content)
+	}
+	return &model.ChatResponse{
+		Message: m,
+		Usage:   model.Usage{Model: "stub", PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3},
+	}, nil
 }
 
 func (s *stubChat) Model() string { return "stub" }
@@ -94,6 +101,17 @@ func TestRunTurnToolCallLoop(t *testing.T) {
 	msgs2 := chat.reqs[1].Messages
 	if len(msgs2) != 3 || msgs2[2].Role != "tool" || msgs2[2].Content != `{"x":1}` {
 		t.Fatalf("second request must carry the tool round-trip: %+v", msgs2)
+	}
+
+	// 每次模型请求落一条用量事件（spec D13）。
+	var usages []model.Usage
+	for _, ev := range sess.Events() {
+		if ev.Type == session.EventUsage {
+			usages = append(usages, *ev.Usage)
+		}
+	}
+	if len(usages) != 2 || usages[0].Model != "stub" || usages[0].TotalTokens != 3 {
+		t.Fatalf("usage events: %+v", usages)
 	}
 }
 

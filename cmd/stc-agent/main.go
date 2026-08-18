@@ -33,6 +33,7 @@ type options struct {
 	cfg        config.Config
 	transcript string
 	toolsDir   string
+	print      string
 }
 
 func defaultConfig() config.Config {
@@ -55,6 +56,8 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 		transcript = fs.String("transcript", "", "append a JSONL transcript to this path; an existing file is replayed")
 		resume     = fs.String("resume", "", "alias of --transcript: resume from this transcript file")
 		toolsDir   = fs.String("tools-dir", "tools.d", "directory of *.wasm guest tools (watched for hot-swap)")
+		printShort = fs.String("p", "", "print mode: run a single turn non-interactively and exit")
+		printLong  = fs.String("print", "", "alias of -p")
 	)
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
@@ -104,7 +107,11 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if *resume != "" {
 		tp = *resume
 	}
-	return options{cfg: cfg, transcript: tp, toolsDir: *toolsDir}, nil
+	pp := *printShort
+	if *printLong != "" {
+		pp = *printLong
+	}
+	return options{cfg: cfg, transcript: tp, toolsDir: *toolsDir, print: pp}, nil
 }
 
 // fileConfig 是配置文件的子集（timeout 只走命令行）。
@@ -159,7 +166,6 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	defer root.Close()
 
 	_, ctlComp := config.NewControl(root, opts.cfg)
-	console := cli.NewConsole(stdin, stdout)
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(stdout, "error: %v\n", err)
@@ -220,14 +226,32 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 			return 1
 		}
 	}
+
+	if opts.print != "" {
+		// headless 一次性模式（spec M5）：跑一轮打印答案退出，不装 REPL。
+		runner, err := stc.Service[loop.Runner](root, loop.KeyRunner)
+		if err != nil {
+			fmt.Fprintf(stdout, "error: %v\n", err)
+			return 1
+		}
+		if err := runner.RunTurn(stdctx.Background(), opts.print, stdout); err != nil {
+			fmt.Fprintf(stdout, "error: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
 	// cli 最后装载：serve 始于其 Apply。先等全部能力 Ready（guest 工具
 	// 的 wasm 编译较慢），第一轮对话才能看到完整的工具表。
+	console := cli.NewConsole(stdin, stdout)
 	cliFiber := root.Load(cli.Component(console))
 	fibers = append(fibers, cliFiber)
 	if !waitReady(cliFiber) {
+		console.Close()
 		return 1
 	}
 
 	<-console.Done()
+	console.Close()
 	return 0
 }

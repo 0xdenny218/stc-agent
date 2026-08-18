@@ -1,10 +1,11 @@
 // Package model implements the chat-model client as a fiber: it injects the
 // config service and provides the chat service, so a config re-provision
-// reloads the client (spec D4). Non-streaming OpenAI-compatible wire format
-// (spec D8).
+// reloads the client (spec D4). Streaming (SSE) is the only model path
+// (spec D14); tool_calls deltas are assembled by index.
 package model
 
 import (
+	"bufio"
 	"bytes"
 	stdctx "context"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/0xdenny218/stc-agent/internal/config"
@@ -53,13 +55,26 @@ type ChatRequest struct {
 	Tools    []ToolSpec // 空则线格式省略 tools 字段
 }
 
-type ChatResponse struct {
-	Message Message
+// Usage 是一次请求的 token 计量。Model 由客户端回填（线格式的 usage 里
+// 没有模型字段），供会话事件日志区分换模型前后的用量。
+type Usage struct {
+	Model            string `json:"model,omitempty"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	TotalTokens      int    `json:"total_tokens"`
 }
 
-// ChatService 由 model fiber 提供；非流式（spec D8）。
+type ChatResponse struct {
+	Message      Message
+	FinishReason string
+	Usage        Usage
+}
+
+// ChatService 由 model fiber 提供；流式为唯一路径（spec D14）。onDelta
+// 按到达顺序收到每个内容增量（可为 nil）；工具调用增量不回调，组装完整
+// 后经返回值给出。
 type ChatService interface {
-	Chat(ctx stdctx.Context, req ChatRequest) (*ChatResponse, error)
+	Chat(ctx stdctx.Context, req ChatRequest, onDelta func(delta string)) (*ChatResponse, error)
 	Model() string
 }
 
@@ -121,24 +136,50 @@ type wireTool struct {
 	Function wireToolFunction `json:"function"`
 }
 
+type wireStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type wireRequest struct {
-	Model    string     `json:"model"`
-	Messages []Message  `json:"messages"`
-	Stream   bool       `json:"stream"`
-	Tools    []wireTool `json:"tools,omitempty"`
+	Model         string             `json:"model"`
+	Messages      []Message          `json:"messages"`
+	Stream        bool               `json:"stream"`
+	StreamOptions *wireStreamOptions `json:"stream_options,omitempty"`
+	Tools         []wireTool         `json:"tools,omitempty"`
 }
 
-type wireResponse struct {
+// wireChunk 是一个 SSE 分片。增量语义：content 追加；tool_calls 按 index
+// 归位、各字段分片追加；usage 只在收尾分片出现（stream_options 开启后）。
+type wireChunk struct {
 	Choices []struct {
-		Message Message `json:"message"`
+		Delta struct {
+			Role      string `json:"role"`
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *Usage `json:"usage"`
 }
 
-func (c *client) Chat(ctx stdctx.Context, req ChatRequest) (*ChatResponse, error) {
+func (c *client) Chat(ctx stdctx.Context, req ChatRequest, onDelta func(string)) (*ChatResponse, error) {
 	ctx, cancel := stdctx.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	wreq := wireRequest{Model: c.model, Messages: req.Messages, Stream: false}
+	wreq := wireRequest{
+		Model:         c.model,
+		Messages:      req.Messages,
+		Stream:        true,
+		StreamOptions: &wireStreamOptions{IncludeUsage: true},
+	}
 	for _, t := range req.Tools {
 		wreq.Tools = append(wreq.Tools, wireTool{
 			Type:     "function",
@@ -158,10 +199,7 @@ func (c *client) Chat(ctx stdctx.Context, req ChatRequest) (*ChatResponse, error
 
 	resp, err := c.hc.Do(hreq)
 	if err != nil {
-		if errors.Is(ctx.Err(), stdctx.DeadlineExceeded) {
-			return nil, &ChatError{Kind: KindTimeout, Err: err}
-		}
-		return nil, &ChatError{Kind: KindTransport, Err: err}
+		return nil, mapErr(err, ctx)
 	}
 	defer resp.Body.Close()
 
@@ -169,14 +207,127 @@ func (c *client) Chat(ctx stdctx.Context, req ChatRequest) (*ChatResponse, error
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return nil, &ChatError{Kind: KindHTTP, Status: resp.StatusCode, Body: string(snippet)}
 	}
-	var wresp wireResponse
-	if err := json.NewDecoder(resp.Body).Decode(&wresp); err != nil {
-		return nil, &ChatError{Kind: KindProtocol, Err: err}
+	res, err := readStream(resp.Body, onDelta)
+	if err != nil {
+		var ce *ChatError
+		if errors.As(err, &ce) {
+			return nil, ce
+		}
+		return nil, mapErr(err, ctx)
 	}
-	if len(wresp.Choices) == 0 {
-		return nil, &ChatError{Kind: KindProtocol, Err: errors.New("response has no choices")}
+	res.Usage.Model = c.model
+	return res, nil
+}
+
+// mapErr 归一化传输层错误：超时单独归类；调用方主动取消（Ctrl-C 中断
+// 本轮、级联重载）原样返回 ctx 错误，供上层区分于真实故障。
+func mapErr(err error, ctx stdctx.Context) error {
+	if errors.Is(ctx.Err(), stdctx.DeadlineExceeded) {
+		return &ChatError{Kind: KindTimeout, Err: err}
 	}
-	return &ChatResponse{Message: wresp.Choices[0].Message}, nil
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return &ChatError{Kind: KindTransport, Err: err}
+}
+
+// assembler 把 SSE 增量分片组装成完整应答：content 追加、tool_calls 按
+// index 归位（各字段分片追加）、finish_reason 与收尾 usage 记录。
+type assembler struct {
+	onDelta      func(string)
+	content      strings.Builder
+	toolCalls    []ToolCall
+	role         string
+	finishReason string
+	usage        Usage
+	sawChunk     bool
+}
+
+// readStream 消费 SSE 流；只认 "data:" 行，[DONE] 或 EOF 收尾。
+func readStream(body io.Reader, onDelta func(string)) (*ChatResponse, error) {
+	a := &assembler{onDelta: onDelta}
+	r := bufio.NewReader(body)
+	for {
+		line, err := r.ReadBytes('\n')
+		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
+			done, hErr := a.handleLine(trimmed)
+			if hErr != nil {
+				return nil, hErr
+			}
+			if done {
+				return a.result()
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return a.result()
+			}
+			return nil, err
+		}
+	}
+}
+
+// handleLine 处理一行 SSE；返回 done = 收到 [DONE] 收尾。
+func (a *assembler) handleLine(line []byte) (done bool, err error) {
+	data, ok := bytes.CutPrefix(line, []byte("data:"))
+	if !ok {
+		return false, nil // event:/注释/空行：忽略
+	}
+	data = bytes.TrimSpace(data)
+	if bytes.Equal(data, []byte("[DONE]")) {
+		return true, nil
+	}
+	var chunk wireChunk
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return false, &ChatError{Kind: KindProtocol, Err: fmt.Errorf("bad SSE chunk: %w", err)}
+	}
+	a.sawChunk = true
+	for _, ch := range chunk.Choices {
+		d := ch.Delta
+		if d.Role != "" {
+			a.role = d.Role
+		}
+		if d.Content != "" {
+			a.content.WriteString(d.Content)
+			if a.onDelta != nil {
+				a.onDelta(d.Content)
+			}
+		}
+		for _, dt := range d.ToolCalls {
+			for len(a.toolCalls) <= dt.Index {
+				a.toolCalls = append(a.toolCalls, ToolCall{})
+			}
+			tc := &a.toolCalls[dt.Index]
+			tc.ID += dt.ID
+			if dt.Type != "" {
+				tc.Type = dt.Type
+			}
+			tc.Function.Name += dt.Function.Name
+			tc.Function.Arguments += dt.Function.Arguments
+		}
+		if ch.FinishReason != "" {
+			a.finishReason = ch.FinishReason
+		}
+	}
+	if chunk.Usage != nil {
+		a.usage = *chunk.Usage
+	}
+	return false, nil
+}
+
+func (a *assembler) result() (*ChatResponse, error) {
+	if !a.sawChunk {
+		return nil, &ChatError{Kind: KindProtocol, Err: errors.New("stream ended without chunks")}
+	}
+	role := a.role
+	if role == "" {
+		role = "assistant"
+	}
+	return &ChatResponse{
+		Message:      Message{Role: role, Content: a.content.String(), ToolCalls: a.toolCalls},
+		FinishReason: a.finishReason,
+		Usage:        a.usage,
+	}, nil
 }
 
 // Component 是模型 fiber：inject config → 提供 chat。config 重提供时

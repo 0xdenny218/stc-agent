@@ -20,7 +20,7 @@ import (
 
 type stubChat struct{}
 
-func (stubChat) Chat(stdctx.Context, model.ChatRequest) (*model.ChatResponse, error) {
+func (stubChat) Chat(stdctx.Context, model.ChatRequest, func(string)) (*model.ChatResponse, error) {
 	return &model.ChatResponse{Message: model.Message{Role: "assistant", Content: "ok"}}, nil
 }
 

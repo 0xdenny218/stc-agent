@@ -48,10 +48,11 @@ echo "==> agent started (pid $agent_pid)"
 
 say() { printf '%s\n' "$1" >&3; }
 
-# wait_turn <消息数>：transcript 每消息一行，攒够即本轮结束。
+# wait_turn <消息数>：transcript 是事件日志（M5 起），按 message 事件
+# 计数——攒够即本轮结束（usage 事件穿插其间，不计入）。
 wait_turn() {
 	local want="$1" deadline=$((SECONDS + 90)) n
-	until [[ -f "$work/chat.jsonl" ]] && n=$(wc -l <"$work/chat.jsonl") && ((n >= want)); do
+	until [[ -f "$work/chat.jsonl" ]] && n=$(grep -c '"type":"message"' "$work/chat.jsonl" || true) && ((n >= want)); do
 		if ((SECONDS > deadline)); then
 			echo "error: timed out waiting for turn to finish; agent log:" >&2
 			cat "$work/agent.log" >&2

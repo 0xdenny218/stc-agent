@@ -8,7 +8,8 @@ spatiotemporal composability paradigm.
 
 > Status: **v0.1.0 released** — every `*.wasm` in `--tools-dir` is a guest
 > tool fiber, hot-swapped in place when you rebuild it, mid-conversation.
-> Milestones M0–M4 done; the harness roadmap (M5–M10) is below.
+> Milestones M0–M5 done (M5: event-log session spine + SSE streaming +
+> readline/`-p` terminal interaction); the harness roadmap (M6–M10) is below.
 
 ## Install
 
@@ -23,7 +24,8 @@ developing guest tools additionally needs [TinyGo](https://tinygo.org/).
 
 ```sh
 export DEEPSEEK_API_KEY=...   # or STC_AGENT_API_KEY / OPENAI_API_KEY
-go run ./cmd/stc-agent
+go run ./cmd/stc-agent                          # interactive REPL
+go run ./cmd/stc-agent -p "explain this repo"   # one-shot: print the answer and exit
 ```
 
 Config precedence: built-in defaults < config file < environment < flags.
@@ -34,10 +36,16 @@ Config precedence: built-in defaults < config file < environment < flags.
 | `--api-key` | `STC_AGENT_API_KEY`, then `DEEPSEEK_API_KEY`, then `OPENAI_API_KEY` | — (required) |
 | `--model` | `STC_AGENT_MODEL` | `deepseek-chat` |
 | `--timeout` | — | `60s` |
-| `--transcript PATH` | — | JSONL transcript; an existing file is replayed |
+| `--transcript PATH` | — | JSONL event log (messages + token usage); an existing file is replayed |
 | `--resume PATH` | — | alias of `--transcript` |
 | `--tools-dir DIR` | — | `tools.d`; every `*.wasm` in it is a guest tool |
 | `--config PATH` | — | `~/.config/stc-agent/config.json` if present |
+| `-p, --print TEXT` | — | run a single turn non-interactively, print the answer, exit 0 |
+
+On a terminal the REPL has readline line editing with history (plain line
+reads when stdin is piped). Model answers stream in as they arrive.
+Ctrl-C interrupts the current turn without killing the session (at the
+prompt it discards the current line); Ctrl-D on an empty line exits.
 
 Commands inside the REPL:
 
@@ -60,11 +68,14 @@ extracted upstream, and this repo deleted its own copies):
   arbitrary commands as your user.** Run it only in directories you are
   comfortable with.
 
-A turn runs `[model → tool]*` until the model answers (tool calls are traced
-as `→ name(args)`), with a circuit breaker of 10 tool iterations. Tool
+A turn runs `[model → tool]*` until the model answers (the answer streams
+in chunk by chunk; tool calls are traced as `→ name(args)`), with a circuit
+breaker of 10 tool iterations. Tool
 failures are fed back to the model as result text, not turn-fatal errors; a
 mid-turn reload fills unanswered tool calls with an aborted marker so the
-transcript stays wire-valid.
+transcript stays wire-valid. The transcript is an append-only event log:
+messages, token usage per model call — the in-memory history is just a
+projection of it, and resume replays the projection.
 
 ## Guest tools (WASM, hot-swapped mid-conversation)
 
@@ -135,7 +146,7 @@ behavior, not the registered name/description.
 
 ## What it is
 
-- A CLI chat agent (stdin/stdout) with a tool-calling loop.
+- A CLI chat agent (stdin/stdout) with a streaming tool-calling loop.
 - Every capability is a fiber: the model client, tools, slash commands, the
   session, the REPL itself. Assembly is entirely paradigm machinery
   (`Load`/`Provide`/`Inject`/`Effect`); `main` only builds the list.
@@ -156,8 +167,8 @@ behavior, not the registered name/description.
   the agent that exercises the framework to its full requirements, so that
   framework capabilities grow upstream via reflux. Its **agent** capability
   set takes [dsh](https://github.com/deepseek-ai/deepseek-harness) as the
-  reference: streaming, approvals, hooks, skills, MCP, subagents and
-  compaction are on the roadmap (M5–M9).
+  reference: approvals, hooks, skills, MCP, subagents and compaction are on
+  the roadmap (M6–M9).
 
 ## Milestones
 
@@ -166,7 +177,7 @@ behavior, not the registered name/description.
 - [x] M2 tool system + agent loop (toolset as stable service, static Go tools)
 - [x] M3 WASM guest tools + hot reload (hmr): mid-conversation tool swap
 - [x] M4 release + satellite-package review (v0.1.0 on GitHub; the review is filed as stc-go issues)
-- [ ] M5 session spine (event log) + streaming + terminal interaction
+- [x] M5 session spine (event log) + streaming + terminal interaction
   (readline, `-p` headless)
 - [ ] M6 tool pipeline + approval gate
 - [ ] M7 hooks + system-prompt assembly + agent self-inspection

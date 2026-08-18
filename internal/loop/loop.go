@@ -66,10 +66,11 @@ func Component(maxTurns int) stc.Component {
 	}
 }
 
-// RunTurn 执行一轮：user 消息入历史 → [模型 → 工具]* → 最终答复。
-// 取消安全：若在工具调用中途被取消，为每个未应答的 tool_call 补一条
-// aborted 结果，保证历史线格式合法（assistant 的 tool_calls 必须各有
-// 对应 tool 消息）。
+// RunTurn 执行一轮：user 消息入历史 → [模型 → 工具]* → 最终答复。模型
+// 内容增量即时渲染到 w（spec D14），每次模型请求的 token 用量写入会话
+// 事件日志（spec D13）。取消安全：若在工具调用中途被取消，为每个未应答
+// 的 tool_call 补一条 aborted 结果，保证历史线格式合法（assistant 的
+// tool_calls 必须各有对应 tool 消息）。
 func (r *runner) RunTurn(ctx stdctx.Context, input string, w io.Writer) error {
 	if err := r.sess.Add(model.Message{Role: "user", Content: input}); err != nil {
 		return err
@@ -78,20 +79,23 @@ func (r *runner) RunTurn(ctx stdctx.Context, input string, w io.Writer) error {
 		resp, err := r.chat.Chat(ctx, model.ChatRequest{
 			Messages: r.sess.History(),
 			Tools:    specs(r.ts.List()),
-		})
+		}, func(delta string) { fmt.Fprint(w, delta) })
 		if err != nil {
 			return err
 		}
 		msg := resp.Message
-		if len(msg.ToolCalls) == 0 {
-			if err := r.sess.Add(msg); err != nil {
-				return err
-			}
-			fmt.Fprintln(w, msg.Content)
-			return nil
-		}
 		if err := r.sess.Add(msg); err != nil {
 			return err
+		}
+		if err := r.sess.AddUsage(resp.Usage); err != nil {
+			return err
+		}
+		if len(msg.ToolCalls) == 0 {
+			fmt.Fprintln(w) // 内容已流式打出，补收尾换行
+			return nil
+		}
+		if msg.Content != "" {
+			fmt.Fprintln(w) // 流式内容与工具轨迹之间换行
 		}
 		answered := 0
 		for i, tc := range msg.ToolCalls {

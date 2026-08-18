@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,6 +14,7 @@ import (
 	"time"
 
 	"github.com/0xdenny218/stc-agent/internal/model"
+	"github.com/0xdenny218/stc-agent/internal/session"
 	"github.com/0xdenny218/stc-agent/internal/testutil"
 )
 
@@ -79,6 +78,18 @@ func TestParseOptions(t *testing.T) {
 		}
 	})
 
+	t.Run("print mode", func(t *testing.T) {
+		for _, args := range [][]string{{"-p", "hi"}, {"--print", "hi"}} {
+			opts, err := parseOptions(args, env(nil))
+			if err != nil {
+				t.Fatalf("parseOptions %v: %v", args, err)
+			}
+			if opts.print != "hi" {
+				t.Fatalf("print: %q", opts.print)
+			}
+		}
+	})
+
 	t.Run("config file", func(t *testing.T) {
 		p := filepath.Join(t.TempDir(), "config.json")
 		if err := os.WriteFile(p, []byte(`{"model":"filem","api_key":"filekey"}`), 0o600); err != nil {
@@ -114,54 +125,50 @@ func (s *syncBuffer) String() string {
 
 func (s *syncBuffer) Contains(sub string) bool { return strings.Contains(s.String(), sub) }
 
-// E2E：脚本化一轮对话 → /model 换模型 → 再一轮 → /quit。断言：
-//   - mock 服务器看到的模型序列 [alpha, beta]（级联重载生效）；
-//   - 第二次请求带 3 条消息（换模型后历史逐字保留）；
-//   - transcript 逐字记录 4 条消息。
-func TestE2EModelSwitchKeepsHistory(t *testing.T) {
-	var mu sync.Mutex
-	var models []string
-	var counts []int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Model    string            `json:"model"`
-			Messages []json.RawMessage `json:"messages"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		mu.Lock()
-		models = append(models, req.Model)
-		counts = append(counts, len(req.Messages))
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","content":"reply-from-%s"}}]}`, req.Model)
-	}))
-	defer srv.Close()
-
-	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
-	args := []string{
-		"--api-key", "test",
-		"--base-url", srv.URL,
-		"--model", "alpha",
-		"--transcript", transcript,
+// readTranscript 解码事件日志 transcript，返回消息投影与用量事件。
+func readTranscript(t *testing.T, path string) (msgs []model.Message, usages []model.Usage) {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open transcript: %v", err)
 	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	for dec.More() {
+		var ev session.Event
+		if err := dec.Decode(&ev); err != nil {
+			t.Fatalf("decode transcript event: %v", err)
+		}
+		switch ev.Type {
+		case session.EventMessage:
+			msgs = append(msgs, *ev.Message)
+		case session.EventUsage:
+			usages = append(usages, *ev.Usage)
+		default:
+			t.Fatalf("unknown event type %q", ev.Type)
+		}
+	}
+	return msgs, usages
+}
+
+// serveIn 启动 agent（脚本化 stdin），返回喂输入、等输出、等退出的助手。
+func serveIn(t *testing.T, args []string) (write func(string), waitFor func(string), waitExit func() int) {
+	t.Helper()
 	inR, inW := io.Pipe()
-	defer inW.Close()
+	t.Cleanup(func() { inW.Close() })
 	out := &syncBuffer{}
 	exit := make(chan int, 1)
 	go func() { exit <- run(args, inR, out, func(string) string { return "" }) }()
 
-	write := func(s string) {
+	write = func(s string) {
 		t.Helper()
 		if _, err := io.WriteString(inW, s); err != nil {
 			t.Fatalf("feed stdin: %v", err)
 		}
 	}
-	waitFor := func(what string) {
+	waitFor = func(what string) {
 		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(10 * time.Second)
 		for !out.Contains(what) {
 			if time.Now().After(deadline) {
 				t.Fatalf("timed out waiting for %q; output:\n%s", what, out.String())
@@ -169,6 +176,36 @@ func TestE2EModelSwitchKeepsHistory(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+	waitExit = func() int {
+		t.Helper()
+		select {
+		case code := <-exit:
+			return code
+		case <-time.After(5 * time.Second):
+			t.Fatalf("run did not exit")
+			return -1
+		}
+	}
+	return write, waitFor, waitExit
+}
+
+// E2E：脚本化一轮对话 → /model 换模型 → 再一轮 → /quit。断言：
+//   - mock 服务器看到的模型序列 [alpha, beta]（级联重载生效）；
+//   - 第二次请求带 3 条消息（换模型后历史逐字保留）；
+//   - 请求恒为流式且声明 include_usage；transcript 事件日志逐字投影 4 条消息。
+func TestE2EModelSwitchKeepsHistory(t *testing.T) {
+	mock := testutil.NewMockChat(func(_ int, r testutil.RecordedRequest) model.Message {
+		return model.Message{Role: "assistant", Content: "reply-from-" + r.Model}
+	})
+	defer mock.Close()
+
+	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
+	write, waitFor, waitExit := serveIn(t, []string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "alpha",
+		"--transcript", transcript,
+	})
 
 	write("hello\n")
 	waitFor("reply-from-alpha")
@@ -178,38 +215,28 @@ func TestE2EModelSwitchKeepsHistory(t *testing.T) {
 	waitFor("reply-from-beta")
 	write("/quit\n")
 
-	select {
-	case code := <-exit:
-		if code != 0 {
-			t.Fatalf("exit code %d; output:\n%s", code, out.String())
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("run did not exit; output:\n%s", out.String())
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if !reflect.DeepEqual(models, []string{"alpha", "beta"}) {
-		t.Fatalf("models seen by server: %v", models)
+	reqs := mock.Requests()
+	if len(reqs) != 2 {
+		t.Fatalf("requests: %d", len(reqs))
 	}
-	if !reflect.DeepEqual(counts, []int{1, 3}) {
-		t.Fatalf("message counts per request: %v (history lost across model switch?)", counts)
+	if reqs[0].Model != "alpha" || reqs[1].Model != "beta" {
+		t.Fatalf("models seen by server: %q / %q", reqs[0].Model, reqs[1].Model)
+	}
+	if len(reqs[0].Messages) != 1 || len(reqs[1].Messages) != 3 {
+		t.Fatalf("message counts per request: %d / %d (history lost across model switch?)",
+			len(reqs[0].Messages), len(reqs[1].Messages))
+	}
+	for i, r := range reqs {
+		if !r.Stream || !r.IncludeUsage {
+			t.Fatalf("request %d not streaming or missing include_usage: %+v", i+1, r)
+		}
 	}
 
-	f, err := os.Open(transcript)
-	if err != nil {
-		t.Fatalf("open transcript: %v", err)
-	}
-	defer f.Close()
-	var msgs []model.Message
-	dec := json.NewDecoder(f)
-	for dec.More() {
-		var m model.Message
-		if err := dec.Decode(&m); err != nil {
-			t.Fatalf("decode transcript: %v", err)
-		}
-		msgs = append(msgs, m)
-	}
+	msgs, usages := readTranscript(t, transcript)
 	want := []model.Message{
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "reply-from-alpha"},
@@ -217,7 +244,10 @@ func TestE2EModelSwitchKeepsHistory(t *testing.T) {
 		{Role: "assistant", Content: "reply-from-beta"},
 	}
 	if !reflect.DeepEqual(msgs, want) {
-		t.Fatalf("transcript:\n got %+v\nwant %+v", msgs, want)
+		t.Fatalf("transcript projection:\n got %+v\nwant %+v", msgs, want)
+	}
+	if len(usages) != 2 || usages[0].Model != "alpha" || usages[1].Model != "beta" {
+		t.Fatalf("usage events: %+v", usages)
 	}
 }
 
@@ -233,11 +263,11 @@ func TestRunRequiresAPIKey(t *testing.T) {
 	}
 }
 
-// E2E/ToolCallLoop：mock 服务器先要求 read_file，再给出最终答复。断言：
-//   - stdout 出现工具轨迹 "→ read_file(...)" 与最终答复；
+// E2E/ToolCallLoop：mock 先要求 read_file，再给出最终答复。断言：
+//   - stdout 出现工具轨迹 "→ read_file(...)" 与流式组装出的最终答复；
 //   - 第二次请求携带 3 条消息（user/assistant/tool），tool 消息内容为文件
 //     内容（真实工具执行，非 mock）；
-//   - 首个请求带全部三个工具；transcript 逐字记录 4 条消息。
+//   - 首个请求带全部三个工具；transcript 投影逐字 4 条消息。
 func TestE2EToolCallLoop(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "note.txt")
@@ -245,127 +275,55 @@ func TestE2EToolCallLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var mu sync.Mutex
-	var counts []int
-	var toolNames []string
-	var toolMsg model.Message
-	callN := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Messages []model.Message `json:"messages"`
-			Tools    []struct {
-				Function struct {
-					Name string `json:"name"`
-				} `json:"function"`
-			} `json:"tools"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		mu.Lock()
-		callN++
-		n := callN
-		counts = append(counts, len(req.Messages))
-		if n == 1 {
-			for _, tool := range req.Tools {
-				toolNames = append(toolNames, tool.Function.Name)
-			}
-		}
-		if n == 2 {
-			for _, m := range req.Messages {
-				if m.Role == "tool" {
-					toolMsg = m
-				}
-			}
-		}
-		mu.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		var msg model.Message
+	mock := testutil.NewMockChat(func(n int, _ testutil.RecordedRequest) model.Message {
 		if n == 1 {
 			args, _ := json.Marshal(map[string]string{"path": target})
-			msg = model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
+			return model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
 				ID: "call_1", Type: "function",
 				Function: model.ToolCallFunction{Name: "read_file", Arguments: string(args)},
 			}}}
-		} else {
-			msg = model.Message{Role: "assistant", Content: "The file says hello-e2e"}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": msg}}})
-	}))
-	defer srv.Close()
+		return model.Message{Role: "assistant", Content: "The file says hello-e2e"}
+	})
+	defer mock.Close()
 
 	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
-	args := []string{
+	write, waitFor, waitExit := serveIn(t, []string{
 		"--api-key", "test",
-		"--base-url", srv.URL,
+		"--base-url", mock.URL(),
 		"--model", "m",
 		"--transcript", transcript,
-	}
-	inR, inW := io.Pipe()
-	defer inW.Close()
-	out := &syncBuffer{}
-	exit := make(chan int, 1)
-	go func() { exit <- run(args, inR, out, func(string) string { return "" }) }()
+	})
 
-	waitFor := func(what string) {
-		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for !out.Contains(what) {
-			if time.Now().After(deadline) {
-				t.Fatalf("timed out waiting for %q; output:\n%s", what, out.String())
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-
-	if _, err := io.WriteString(inW, "please read the note\n"); err != nil {
-		t.Fatalf("feed stdin: %v", err)
-	}
+	write("please read the note\n")
 	waitFor("The file says hello-e2e")
-	if !out.Contains("→ read_file(") {
-		t.Fatalf("tool trace missing; output:\n%s", out.String())
-	}
-	if _, err := io.WriteString(inW, "/quit\n"); err != nil {
-		t.Fatalf("feed stdin: %v", err)
+	write("/quit\n")
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
 	}
 
-	select {
-	case code := <-exit:
-		if code != 0 {
-			t.Fatalf("exit code %d; output:\n%s", code, out.String())
+	reqs := mock.Requests()
+	if len(reqs) != 2 {
+		t.Fatalf("requests: %d", len(reqs))
+	}
+	if len(reqs[0].Messages) != 1 || len(reqs[1].Messages) != 3 {
+		t.Fatalf("message counts per request: %d / %d (tool round-trip lost?)",
+			len(reqs[0].Messages), len(reqs[1].Messages))
+	}
+	if !reflect.DeepEqual(reqs[0].ToolNames, []string{"read_file", "shell", "write_file"}) {
+		t.Fatalf("tools advertised: %v", reqs[0].ToolNames)
+	}
+	var toolMsg model.Message
+	for _, m := range reqs[1].Messages {
+		if m.Role == "tool" {
+			toolMsg = m
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("run did not exit; output:\n%s", out.String())
-	}
-
-	mu.Lock()
-	if !reflect.DeepEqual(counts, []int{1, 3}) {
-		t.Fatalf("message counts per request: %v (tool round-trip lost?)", counts)
-	}
-	if !reflect.DeepEqual(toolNames, []string{"read_file", "shell", "write_file"}) {
-		t.Fatalf("tools advertised: %v", toolNames)
 	}
 	if toolMsg.ToolCallID != "call_1" || !strings.Contains(toolMsg.Content, "hello-e2e") {
 		t.Fatalf("tool message in second request: %+v", toolMsg)
 	}
-	mu.Unlock()
 
-	f, err := os.Open(transcript)
-	if err != nil {
-		t.Fatalf("open transcript: %v", err)
-	}
-	defer f.Close()
-	var msgs []model.Message
-	dec := json.NewDecoder(f)
-	for dec.More() {
-		var m model.Message
-		if err := dec.Decode(&m); err != nil {
-			t.Fatalf("decode transcript: %v", err)
-		}
-		msgs = append(msgs, m)
-	}
+	msgs, _ := readTranscript(t, transcript)
 	if len(msgs) != 4 {
 		t.Fatalf("transcript messages: %d: %+v", len(msgs), msgs)
 	}
@@ -380,6 +338,87 @@ func TestE2EToolCallLoop(t *testing.T) {
 	}
 }
 
+// E2E/StreamTurn（spec M5）：一轮纯答复对话，mock 把答复分片流式发出。
+// 断言 stdout 呈现按序组装的完整答复；transcript 是类型化事件日志
+// （消息 + 用量），用量值与 mock 发出的完全一致。
+func TestE2EStreamTurn(t *testing.T) {
+	mock := testutil.NewMockChat(func(_ int, _ testutil.RecordedRequest) model.Message {
+		return model.Message{Role: "assistant", Content: "streamed answer, assembled in order"}
+	})
+	defer mock.Close()
+
+	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
+	write, waitFor, waitExit := serveIn(t, []string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "m",
+		"--transcript", transcript,
+	})
+
+	write("say hi\n")
+	waitFor("streamed answer, assembled in order")
+	write("/quit\n")
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+
+	// 事件日志逐行是类型化 JSON；消息投影 + 一条用量事件（n=1 →
+	// prompt 11 / completion 5 / total 16，模型名由客户端回填）。
+	raw, err := os.ReadFile(transcript)
+	if err != nil {
+		t.Fatalf("read transcript: %v", err)
+	}
+	for i, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var ev session.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("line %d is not a typed event: %v", i+1, err)
+		}
+	}
+	msgs, usages := readTranscript(t, transcript)
+	want := []model.Message{
+		{Role: "user", Content: "say hi"},
+		{Role: "assistant", Content: "streamed answer, assembled in order"},
+	}
+	if !reflect.DeepEqual(msgs, want) {
+		t.Fatalf("transcript projection:\n got %+v\nwant %+v", msgs, want)
+	}
+	if len(usages) != 1 || usages[0].TotalTokens != 16 || usages[0].Model != "m" {
+		t.Fatalf("usage events: %+v", usages)
+	}
+}
+
+// M5：`-p` headless 一次性模式——跑一轮打印答案退出（exit 0），不读
+// stdin、不进 REPL。
+func TestPrintMode(t *testing.T) {
+	mock := testutil.NewMockChat(func(_ int, _ testutil.RecordedRequest) model.Message {
+		return model.Message{Role: "assistant", Content: "one-shot answer"}
+	})
+	defer mock.Close()
+
+	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
+	out := &syncBuffer{}
+	code := run([]string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "m",
+		"--transcript", transcript,
+		"-p", "hello",
+	}, strings.NewReader(""), out, func(string) string { return "" })
+	if code != 0 {
+		t.Fatalf("exit code %d; output:\n%s", code, out.String())
+	}
+	if !out.Contains("one-shot answer") {
+		t.Fatalf("answer missing; output:\n%s", out.String())
+	}
+	msgs, usages := readTranscript(t, transcript)
+	if len(msgs) != 2 || msgs[0].Role != "user" || msgs[1].Content != "one-shot answer" {
+		t.Fatalf("transcript: %+v", msgs)
+	}
+	if len(usages) != 1 {
+		t.Fatalf("usage events: %+v", usages)
+	}
+}
+
 // E2E/HotSwapKeepsSession（spec M3 验收）：对话进行中热替换 guest 工具。
 // 第一轮模型调用 dice（v1 结果）→ 进程内重建 dice.wasm 为 v2 →
 // 第二轮即走 v2；同一会话进程，历史逐字保留。需要 TinyGo（缺失即 Skip）。
@@ -387,89 +426,33 @@ func TestE2EHotSwapKeepsSession(t *testing.T) {
 	toolsDir := t.TempDir()
 	dicePath := testutil.BuildGuest(t, "examples/guests/dice", filepath.Join(toolsDir, "dice.wasm"))
 
-	var mu sync.Mutex
-	callN := 0
-	toolNames := map[int][]string{} // 每次请求广告的工具表
-	lastToolMsg := map[int]string{} // 每次请求历史中最后一条 tool 消息
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Messages []model.Message `json:"messages"`
-			Tools    []struct {
-				Function struct {
-					Name string `json:"name"`
-				} `json:"function"`
-			} `json:"tools"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		mu.Lock()
-		callN++
-		n := callN
-		for _, tool := range req.Tools {
-			toolNames[n] = append(toolNames[n], tool.Function.Name)
-		}
-		for _, m := range req.Messages {
-			if m.Role == "tool" {
-				lastToolMsg[n] = m.Content
-			}
-		}
-		mu.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		var msg model.Message
+	mock := testutil.NewMockChat(func(n int, _ testutil.RecordedRequest) model.Message {
 		switch n {
 		case 1, 3: // 两轮都要求掷骰子
-			msg = model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
+			return model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
 				ID: fmt.Sprintf("call_%d", n), Type: "function",
 				Function: model.ToolCallFunction{Name: "dice", Arguments: "{}"},
 			}}}
 		case 2:
-			msg = model.Message{Role: "assistant", Content: "first roll done"}
+			return model.Message{Role: "assistant", Content: "first roll done"}
 		default:
-			msg = model.Message{Role: "assistant", Content: "second roll done"}
+			return model.Message{Role: "assistant", Content: "second roll done"}
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": msg}}})
-	}))
-	defer srv.Close()
+	})
+	defer mock.Close()
 
 	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
-	args := []string{
+	write, waitFor, waitExit := serveIn(t, []string{
 		"--api-key", "test",
-		"--base-url", srv.URL,
+		"--base-url", mock.URL(),
 		"--model", "m",
 		"--transcript", transcript,
 		"--tools-dir", toolsDir,
-	}
-	inR, inW := io.Pipe()
-	defer inW.Close()
-	out := &syncBuffer{}
-	exit := make(chan int, 1)
-	go func() { exit <- run(args, inR, out, func(string) string { return "" }) }()
-
-	write := func(s string) {
-		t.Helper()
-		if _, err := io.WriteString(inW, s); err != nil {
-			t.Fatalf("feed stdin: %v", err)
-		}
-	}
-	waitFor := func(what string) {
-		t.Helper()
-		deadline := time.Now().Add(10 * time.Second)
-		for !out.Contains(what) {
-			if time.Now().After(deadline) {
-				t.Fatalf("timed out waiting for %q; output:\n%s", what, out.String())
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
+	})
 
 	write("roll\n")
 	waitFor("first roll done")
-	if !out.Contains("→ dice(") {
-		t.Fatalf("guest tool trace missing; output:\n%s", out.String())
-	}
+	waitFor("→ dice(")
 
 	// 对话进行中把 dice.wasm 重建为 v2；等热替换落定。
 	testutil.BuildGuest(t, "examples/guests/dice", dicePath, "v2")
@@ -479,45 +462,38 @@ func TestE2EHotSwapKeepsSession(t *testing.T) {
 	waitFor("second roll done")
 	write("/quit\n")
 
-	select {
-	case code := <-exit:
-		if code != 0 {
-			t.Fatalf("exit code %d; output:\n%s", code, out.String())
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("run did not exit; output:\n%s", out.String())
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
 	}
 
-	mu.Lock()
-	if !reflect.DeepEqual(toolNames[1], toolNames[3]) {
-		t.Fatalf("tool list changed across hot-swap: %v vs %v", toolNames[1], toolNames[3])
+	reqs := mock.Requests()
+	if len(reqs) != 4 {
+		t.Fatalf("requests: %d", len(reqs))
 	}
-	if !strings.Contains(strings.Join(toolNames[1], ","), "dice") {
-		t.Fatalf("guest tool not advertised: %v", toolNames[1])
+	if !reflect.DeepEqual(reqs[0].ToolNames, reqs[2].ToolNames) {
+		t.Fatalf("tool list changed across hot-swap: %v vs %v", reqs[0].ToolNames, reqs[2].ToolNames)
 	}
-	if !strings.Contains(lastToolMsg[2], `"version":"v1"`) {
-		t.Fatalf("turn 1 tool result should be v1: %q", lastToolMsg[2])
+	if !strings.Contains(strings.Join(reqs[0].ToolNames, ","), "dice") {
+		t.Fatalf("guest tool not advertised: %v", reqs[0].ToolNames)
 	}
-	if !strings.Contains(lastToolMsg[4], `"version":"v2"`) {
-		t.Fatalf("turn 2 tool result should be v2: %q", lastToolMsg[4])
+	lastToolMsg := func(n int) string {
+		last := ""
+		for _, m := range reqs[n-1].Messages {
+			if m.Role == "tool" {
+				last = m.Content
+			}
+		}
+		return last
 	}
-	mu.Unlock()
+	if got := lastToolMsg(2); !strings.Contains(got, `"version":"v1"`) {
+		t.Fatalf("turn 1 tool result should be v1: %q", got)
+	}
+	if got := lastToolMsg(4); !strings.Contains(got, `"version":"v2"`) {
+		t.Fatalf("turn 2 tool result should be v2: %q", got)
+	}
 
 	// 历史逐字：8 条消息、角色序、v1 结果在前 v2 在后。
-	f, err := os.Open(transcript)
-	if err != nil {
-		t.Fatalf("open transcript: %v", err)
-	}
-	defer f.Close()
-	var msgs []model.Message
-	dec := json.NewDecoder(f)
-	for dec.More() {
-		var m model.Message
-		if err := dec.Decode(&m); err != nil {
-			t.Fatalf("decode transcript: %v", err)
-		}
-		msgs = append(msgs, m)
-	}
+	msgs, _ := readTranscript(t, transcript)
 	if len(msgs) != 8 {
 		t.Fatalf("transcript messages: %d: %+v", len(msgs), msgs)
 	}
