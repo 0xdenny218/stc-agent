@@ -129,7 +129,6 @@ func Run(ctx stdctx.Context, home *stc.Context, ts *tools.Toolset, opts Options,
 		child.Load(session.Component("")),
 		child.Load(toolsetComponent(subset)),
 		child.Load(noticesComponent()),
-		child.Load(loop.Component(loop.Options{MaxTurns: opts.MaxTurns})),
 	}
 	// 撤退：fiber 逐个 Dispose（卸载异步，fire-and-forget——unprovide
 	// 与 Isolate 撤销都作用于已不可达的 realm，顺序无关，残留 fiber
@@ -141,14 +140,26 @@ func Run(ctx stdctx.Context, home *stc.Context, ts *tools.Toolset, opts Options,
 		_ = child.Release()
 	}()
 
-	// 只等 loop fiber：它 Active 即全部 inject（会话/工具表/通知 +
-	// 父域的 chat/approval/hooks/prompt）解析成功。
+	// 先等三个服务 fiber Active、隔离域内的 provide 落地，再装 loop：
+	// realm 链回落不是原子配对——loop 若在兄弟 provide 之前被评估或
+	// 装载，依赖解析会回退到父域实例（子集混入 task、子轮写进父会话、
+	// 终答读空；低核 CI 偶发，GOMAXPROCS=2 可稳定复现）。
 	boot, cancel := stdctx.WithTimeout(ctx, 10*time.Second)
-	err = fibers[len(fibers)-1].Ready(boot)
-	cancel()
-	if err != nil {
+	for _, f := range fibers {
+		if err := f.Ready(boot); err != nil {
+			cancel()
+			return "", fmt.Errorf("task: start sub-agent: %w", err)
+		}
+	}
+	loopF := child.Load(loop.Component(loop.Options{MaxTurns: opts.MaxTurns}))
+	fibers = append(fibers, loopF)
+	// loop Active 即全部 inject（会话/工具表/通知 + 父域的
+	// chat/approval/hooks/prompt）在子域解析成功。
+	if err := loopF.Ready(boot); err != nil {
+		cancel()
 		return "", fmt.Errorf("task: start sub-agent: %w", err)
 	}
+	cancel()
 	runner, err := stc.Service[loop.Runner](child, loop.KeyRunner)
 	if err != nil {
 		return "", err
