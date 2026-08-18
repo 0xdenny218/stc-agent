@@ -21,9 +21,11 @@ type MockChat struct {
 	script func(n int, r RecordedRequest) model.Message
 }
 
-// RecordedRequest 是 mock 看到的一次请求。
+// RecordedRequest 是 mock 看到的一次请求。首条 system 消息从 Messages
+// 拆出到 System（与 model.ChatRequest 同构），Messages 只含会话消息。
 type RecordedRequest struct {
 	Model        string
+	System       string
 	Messages     []model.Message
 	ToolNames    []string
 	Stream       bool
@@ -67,6 +69,10 @@ func (m *MockChat) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec := RecordedRequest{Model: req.Model, Messages: req.Messages, Stream: req.Stream}
+	if len(rec.Messages) > 0 && rec.Messages[0].Role == "system" {
+		rec.System = rec.Messages[0].Content
+		rec.Messages = rec.Messages[1:]
+	}
 	if req.StreamOptions != nil {
 		rec.IncludeUsage = req.StreamOptions.IncludeUsage
 	}

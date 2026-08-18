@@ -51,6 +51,9 @@ type ToolSpec struct {
 }
 
 type ChatRequest struct {
+	// System 是组装好的 system prompt（spec D16 段落注册表的产物）；
+	// 非空时作为第一条 system 消息上线，不进会话历史。
+	System   string
 	Messages []Message
 	Tools    []ToolSpec // 空则线格式省略 tools 字段
 }
@@ -179,6 +182,10 @@ func (c *client) Chat(ctx stdctx.Context, req ChatRequest, onDelta func(string))
 		Messages:      req.Messages,
 		Stream:        true,
 		StreamOptions: &wireStreamOptions{IncludeUsage: true},
+	}
+	if req.System != "" {
+		// system 消息只在线格式头部出现，不入会话事件日志。
+		wreq.Messages = append([]Message{{Role: "system", Content: req.System}}, req.Messages...)
 	}
 	for _, t := range req.Tools {
 		wreq.Tools = append(wreq.Tools, wireTool{

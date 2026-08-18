@@ -12,11 +12,14 @@ import (
 	"time"
 
 	"github.com/0xdenny218/stc-agent/internal/approval"
+	"github.com/0xdenny218/stc-agent/internal/hooks"
 	"github.com/0xdenny218/stc-agent/internal/loop"
 	"github.com/0xdenny218/stc-agent/internal/model"
+	"github.com/0xdenny218/stc-agent/internal/prompt"
 	"github.com/0xdenny218/stc-agent/internal/session"
 	"github.com/0xdenny218/stc-agent/internal/tools"
 	stc "github.com/0xdenny218/stc-go"
+	"github.com/0xdenny218/stc-go/registry"
 )
 
 type stubChat struct{}
@@ -42,7 +45,7 @@ func TestToolEffectExactness(t *testing.T) {
 	ctx, cancel := stdctx.WithTimeout(stdctx.Background(), 5*time.Second)
 	defer cancel()
 
-	// loop 的另三个依赖以稳定桩提供，专注观察工具效应。
+	// loop 的另五个依赖以稳定桩提供，专注观察工具效应。
 	if _, err := root.Provide(model.KeyChat, stubChat{}); err != nil {
 		t.Fatalf("provide chat: %v", err)
 	}
@@ -51,6 +54,12 @@ func TestToolEffectExactness(t *testing.T) {
 	}
 	if _, err := root.Provide(approval.KeyApprover, approval.Gate(allowAllGate{})); err != nil {
 		t.Fatalf("provide approval gate: %v", err)
+	}
+	if _, err := root.Provide(hooks.KeyHooks, registry.New[hooks.Interceptor]()); err != nil {
+		t.Fatalf("provide hooks: %v", err)
+	}
+	if _, err := root.Provide(prompt.KeyPrompt, registry.New[string]()); err != nil {
+		t.Fatalf("provide prompt: %v", err)
 	}
 
 	load := func(c stc.Component) *stc.Fiber {

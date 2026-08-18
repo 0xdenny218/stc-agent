@@ -9,10 +9,12 @@ import (
 	"testing"
 
 	"github.com/0xdenny218/stc-agent/internal/approval"
+	"github.com/0xdenny218/stc-agent/internal/hooks"
 	"github.com/0xdenny218/stc-agent/internal/interaction"
 	"github.com/0xdenny218/stc-agent/internal/model"
 	"github.com/0xdenny218/stc-agent/internal/session"
 	"github.com/0xdenny218/stc-agent/internal/tools"
+	stc "github.com/0xdenny218/stc-go"
 	"github.com/0xdenny218/stc-go/registry"
 )
 
@@ -78,6 +80,21 @@ func echoTool() tools.Tool {
 	}
 }
 
+// newTestRunner 补齐 runner 的 M7 依赖：空拦截表、空段落表、独立的根
+// context（hooks.Emit 需要）。测试要装拦截 hook / 段落时直接改
+// r.ic / r.segments（注册表可原地增删）。
+func newTestRunner(t *testing.T, chat model.ChatService, sess *session.Session,
+	ts *tools.Toolset, gate approval.Gate, maxTurns int) *runner {
+	t.Helper()
+	root := stc.New()
+	t.Cleanup(func() { root.Close() })
+	return &runner{
+		chat: chat, sess: sess, ts: ts, gate: gate,
+		ic: registry.New[hooks.Interceptor](), segments: registry.New[string](),
+		fctx: root, maxTurns: maxTurns,
+	}
+}
+
 // Contract/ToolCallLoop：一轮输入驱动 [模型→工具]* 直到最终答复；历史为
 // user/assistant(tool_calls)/tool/assistant，工具结果回灌进下一次请求。
 func TestRunTurnToolCallLoop(t *testing.T) {
@@ -88,7 +105,7 @@ func TestRunTurnToolCallLoop(t *testing.T) {
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c1", "echo", `{"x":1}`)}},
 		{Role: "assistant", Content: "done"},
 	}}
-	r := &runner{chat: chat, sess: sess, ts: ts, gate: allowGate{}, maxTurns: 5}
+	r := newTestRunner(t, chat, sess, ts, allowGate{}, 5)
 
 	var out strings.Builder
 	if err := r.RunTurn(stdctx.Background(), "hi", &out); err != nil {
@@ -157,8 +174,7 @@ func TestRunTurnApprovalDeniedFeedsBack(t *testing.T) {
 		}},
 		{Role: "assistant", Content: "done"},
 	}}
-	r := &runner{chat: chat, sess: sess, ts: ts,
-		gate: denyGate{tool: "rm", reason: "denied by user"}, maxTurns: 5}
+	r := newTestRunner(t, chat, sess, ts, denyGate{tool: "rm", reason: "denied by user"}, 5)
 
 	var out strings.Builder
 	if err := r.RunTurn(stdctx.Background(), "hi", &out); err != nil {
@@ -199,7 +215,7 @@ func TestRunTurnApprovalAbortInterrupts(t *testing.T) {
 			fnCall("c2", "echo", `{}`),
 		}},
 	}}
-	r := &runner{chat: chat, sess: sess, ts: ts, gate: abortGate{}, maxTurns: 5}
+	r := newTestRunner(t, chat, sess, ts, abortGate{}, 5)
 
 	var out strings.Builder
 	err := r.RunTurn(stdctx.Background(), "hi", &out)
@@ -234,7 +250,7 @@ func TestRunTurnMaxTurns(t *testing.T) {
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c2", "echo", `{}`)}},
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c3", "echo", `{}`)}},
 	}}
-	r := &runner{chat: chat, sess: sess, ts: ts, gate: allowGate{}, maxTurns: 3}
+	r := newTestRunner(t, chat, sess, ts, allowGate{}, 3)
 
 	var out strings.Builder
 	err := r.RunTurn(stdctx.Background(), "spin", &out)
@@ -267,7 +283,7 @@ func TestRunTurnAbortFillsToolResults(t *testing.T) {
 	chat := &stubChat{replies: []model.Message{
 		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c1", "block", `{}`), fnCall("c2", "echo", `{}`)}},
 	}}
-	r := &runner{chat: chat, sess: sess, ts: ts, gate: allowGate{}, maxTurns: 5}
+	r := newTestRunner(t, chat, sess, ts, allowGate{}, 5)
 
 	var out strings.Builder
 	err := r.RunTurn(ctx, "hi", &out)
@@ -295,5 +311,155 @@ func TestRunTurnAbortFillsToolResults(t *testing.T) {
 	}
 	if !strings.Contains(answered["c2"], "turn aborted") {
 		t.Fatalf("aborted fill: %q", answered["c2"])
+	}
+}
+
+// Contract/HookBail（spec M7 验收）：tools/pre-execute 拦截 hook 以 bail
+// 语义阻断执行——原因作为工具结果回灌模型，被拦工具不执行，同批其余
+// 工具照常执行；审批门在 hook 之后（被拦的调用不再打扰用户）。
+func TestHookBail(t *testing.T) {
+	sess := &session.Session{}
+	ts := registry.New[tools.Tool]()
+	ts.Register("rm", tools.Tool{
+		Name: "rm", Description: "never runs in this test",
+		Parameters: json.RawMessage(`{"type":"object"}`),
+		Invoke: func(stdctx.Context, json.RawMessage) (string, error) {
+			return "EXECUTED", nil
+		},
+	})
+	ts.Register("echo", echoTool())
+	chat := &stubChat{replies: []model.Message{
+		{Role: "assistant", ToolCalls: []model.ToolCall{
+			fnCall("c1", "rm", `{"path":"/x"}`),
+			fnCall("c2", "echo", `{"ok":true}`),
+		}},
+		{Role: "assistant", Content: "done"},
+	}}
+	r := newTestRunner(t, chat, sess, ts, allowGate{}, 5)
+	r.ic.Register("guard", hooks.Interceptor{
+		Event: hooks.ToolPreExecute,
+		Check: func(_ stdctx.Context, p hooks.Payload) error {
+			if p.Tool == "rm" {
+				return errors.New("blocked: destructive command")
+			}
+			return nil
+		},
+	})
+
+	var out strings.Builder
+	if err := r.RunTurn(stdctx.Background(), "hi", &out); err != nil {
+		t.Fatalf("bail is not a turn error: %v", err)
+	}
+
+	hist := sess.History()
+	if len(hist) != 5 { // user + assistant + 2×tool + assistant
+		t.Fatalf("history length: %d: %+v", len(hist), hist)
+	}
+	if got := hist[2].Content; !strings.Contains(got, "blocked: destructive command") {
+		t.Fatalf("bail reason should feed back as tool result: %q", got)
+	}
+	if strings.Contains(hist[2].Content, "EXECUTED") {
+		t.Fatalf("bailed tool must not execute: %q", hist[2].Content)
+	}
+	if got := hist[3].Content; got != `{"ok":true}` {
+		t.Fatalf("sibling tool unaffected: %q", got)
+	}
+
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	if len(chat.reqs) != 2 || chat.reqs[1].Messages[2].Content != hist[2].Content {
+		t.Fatalf("bail reason must reach the next model request: %+v", chat.reqs)
+	}
+}
+
+// 通知型事件：轮次边界（turn-start/end）与 tools/post-execute 都经
+// On/Emit 派发到监听者；负载逐字段对应。
+func TestHookNotify(t *testing.T) {
+	sess := &session.Session{}
+	ts := registry.New[tools.Tool]()
+	ts.Register("echo", echoTool())
+	chat := &stubChat{replies: []model.Message{
+		{Role: "assistant", ToolCalls: []model.ToolCall{fnCall("c1", "echo", `{"x":1}`)}},
+		{Role: "assistant", Content: "done"},
+	}}
+	r := newTestRunner(t, chat, sess, ts, allowGate{}, 5)
+
+	type got struct {
+		event string
+		p     hooks.Payload
+	}
+	var mu sync.Mutex
+	var events []got
+	listen := func(event string) {
+		if err := hooks.Listen(r.fctx, event, func(p hooks.Payload) {
+			mu.Lock()
+			events = append(events, got{event, p})
+			mu.Unlock()
+		}); err != nil {
+			t.Fatalf("listen %s: %v", event, err)
+		}
+	}
+	listen(hooks.TurnStart)
+	listen(hooks.TurnEnd)
+	listen(hooks.ToolPostExecute)
+
+	var out strings.Builder
+	if err := r.RunTurn(stdctx.Background(), "hi", &out); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 3 {
+		t.Fatalf("events: %+v", events)
+	}
+	if events[0].event != hooks.TurnStart || events[0].p.Text != "hi" {
+		t.Fatalf("turn-start: %+v", events[0])
+	}
+	if events[1].event != hooks.ToolPostExecute ||
+		events[1].p.Tool != "echo" || events[1].p.Result != `{"x":1}` {
+		t.Fatalf("post-execute: %+v", events[1])
+	}
+	if events[2].event != hooks.TurnEnd || events[2].p.Text != "done" {
+		t.Fatalf("turn-end: %+v", events[2])
+	}
+}
+
+// 段落组装进请求：system prompt 每次请求前现装，随段落注册表变化。
+func TestRunTurnSystemPrompt(t *testing.T) {
+	sess := &session.Session{}
+	ts := registry.New[tools.Tool]()
+	chat := &stubChat{replies: []model.Message{
+		{Role: "assistant", Content: "one"},
+		{Role: "assistant", Content: "two"},
+	}}
+	r := newTestRunner(t, chat, sess, ts, allowGate{}, 5)
+	r.segments.Register("10-identity", "you are stc-agent")
+
+	var out strings.Builder
+	if err := r.RunTurn(stdctx.Background(), "hi", &out); err != nil {
+		t.Fatalf("turn 1: %v", err)
+	}
+	r.segments.Register("50-extra", "be terse") // 轮次之间落一段
+	if err := r.RunTurn(stdctx.Background(), "again", &out); err != nil {
+		t.Fatalf("turn 2: %v", err)
+	}
+
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	if len(chat.reqs) != 2 {
+		t.Fatalf("chat calls: %d", len(chat.reqs))
+	}
+	if got := chat.reqs[0].System; got != "you are stc-agent" {
+		t.Fatalf("turn 1 system: %q", got)
+	}
+	if got, want := chat.reqs[1].System, "you are stc-agent\n\nbe terse"; got != want {
+		t.Fatalf("turn 2 system: %q, want %q", got, want)
+	}
+	// system 不进会话历史。
+	for _, m := range sess.History() {
+		if m.Role == "system" {
+			t.Fatalf("system must stay out of history: %+v", sess.History())
+		}
 	}
 }

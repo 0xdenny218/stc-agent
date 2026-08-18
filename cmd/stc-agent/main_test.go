@@ -130,7 +130,7 @@ func TestParseOptions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseOptions: %v", err)
 		}
-		if !reflect.DeepEqual(opts.policy.Allow, []string{"read_file"}) || len(opts.policy.Deny) != 0 {
+		if !reflect.DeepEqual(opts.policy.Allow, []string{"read_file", "inspect_agent"}) || len(opts.policy.Deny) != 0 {
 			t.Fatalf("default policy: %+v", opts.policy)
 		}
 	})
@@ -343,7 +343,7 @@ func TestE2EToolCallLoop(t *testing.T) {
 		t.Fatalf("message counts per request: %d / %d (tool round-trip lost?)",
 			len(reqs[0].Messages), len(reqs[1].Messages))
 	}
-	if !reflect.DeepEqual(reqs[0].ToolNames, []string{"read_file", "shell", "write_file"}) {
+	if !reflect.DeepEqual(reqs[0].ToolNames, []string{"inspect_agent", "read_file", "shell", "write_file"}) {
 		t.Fatalf("tools advertised: %v", reqs[0].ToolNames)
 	}
 	var toolMsg model.Message

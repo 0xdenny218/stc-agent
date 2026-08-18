@@ -53,22 +53,29 @@ var KeyConfigCtl = stc.NewKey[*Control]("configctl")
 // 的换血序列（stc-go 生命周期契约）。
 type Control struct {
 	root *stc.Context
+	// track 把当前 config fiber 登记进 fiber 目录（inspect），返回的逆在
+	// 换血/清理时摘除；nil 表示不登记。
+	track func(*stc.Fiber) stc.Inverse
 
-	mu  sync.Mutex
-	cur Config
-	fib *stc.Fiber
+	mu      sync.Mutex
+	cur     Config
+	fib     *stc.Fiber
+	untrack stc.Inverse
 }
 
 // NewControl 返回控制服务及其组件。root 用于装载 config fiber：注册表
 // 中独立的子 fiber，卸载由组件逆显式负责（嵌套 fiber 不级联，stc-go D7）。
-func NewControl(root *stc.Context, initial Config) (*Control, stc.Component) {
-	ctl := &Control{root: root, cur: initial}
+func NewControl(root *stc.Context, initial Config, track func(*stc.Fiber) stc.Inverse) (*Control, stc.Component) {
+	ctl := &Control{root: root, cur: initial, track: track}
 	return ctl, stc.Component{
 		Name:    "configctl",
 		Provide: []stc.Key{KeyConfigCtl},
 		Apply: func(c *stc.Context) (stc.Inverse, error) {
 			ctl.mu.Lock()
 			ctl.fib = root.Load(component(ctl.cur))
+			if ctl.track != nil {
+				ctl.untrack = ctl.track(ctl.fib)
+			}
 			ctl.mu.Unlock()
 			// 先登记子 fiber 的清理再提供 ctl：LIFO 回卷时先撤 ctl
 			// 服务，再拆 config fiber。
@@ -76,11 +83,17 @@ func NewControl(root *stc.Context, initial Config) (*Control, stc.Component) {
 				return func() error {
 					ctl.mu.Lock()
 					f := ctl.fib
+					untrack := ctl.untrack
+					ctl.untrack = nil
 					ctl.mu.Unlock()
 					f.Dispose()
 					ctx, cancel := stdctx.WithTimeout(stdctx.Background(), 5*time.Second)
 					defer cancel()
-					return f.Gone(ctx)
+					err := f.Gone(ctx)
+					if untrack != nil {
+						untrack()
+					}
+					return err
 				}
 			}); err != nil {
 				return nil, err
@@ -127,6 +140,10 @@ func (ctl *Control) SetModel(ctx stdctx.Context, model string) error {
 	if err := old.Gone(wait); err != nil {
 		return fmt.Errorf("config: waiting old config gone: %w", err)
 	}
+	if ctl.untrack != nil { // 旧 fiber 从目录摘除
+		ctl.untrack()
+		ctl.untrack = nil
+	}
 	f := ctl.root.Load(component(next))
 	if err := f.Ready(wait); err != nil {
 		rb := ctl.root.Load(component(ctl.cur))
@@ -134,9 +151,15 @@ func (ctl *Control) SetModel(ctx stdctx.Context, model string) error {
 			return fmt.Errorf("config: switch failed (%v); rollback also failed: %w", err, rbErr)
 		}
 		ctl.fib = rb
+		if ctl.track != nil {
+			ctl.untrack = ctl.track(rb)
+		}
 		return fmt.Errorf("config: switch failed, rolled back: %w", err)
 	}
 	ctl.cur = next
 	ctl.fib = f
+	if ctl.track != nil {
+		ctl.untrack = ctl.track(f)
+	}
 	return nil
 }

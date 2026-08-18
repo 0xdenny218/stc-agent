@@ -8,8 +8,8 @@ spatiotemporal composability paradigm.
 
 > Status: **v0.1.1 released** — every `*.wasm` in `--tools-dir` is a guest
 > tool fiber, hot-swapped in place when you rebuild it, mid-conversation.
-> Milestones M0–M6 done (M6: tool pipeline + approval gate); the harness
-> roadmap (M7–M10) is below.
+> Milestones M0–M7 done (M7: hooks + prompt segments + self-inspection);
+> the harness roadmap (M8–M10) is below.
 
 ## Install
 
@@ -66,6 +66,9 @@ extracted upstream, and this repo deleted its own copies):
 - `read_file` / `write_file` — filesystem access, 32 KiB output cap.
 - `shell` — `sh -c` with a 30s timeout, working directory pinned to the
   launch directory.
+- `inspect_agent` — self-description: every fiber's live state plus the
+  current tool catalog, as JSON. Read-only, auto-approved by the default
+  policy.
 
 Every tool call passes an approval gate before it runs. The default policy
 auto-approves `read_file` and asks about everything else; configure it in
@@ -87,6 +90,21 @@ mode) the gate is fail-closed: having to ask means denying. Every decision
 reached by asking — allow or deny — is appended to the transcript as an
 `approval` event with its source (`user` / `policy` / `fail-closed`);
 policy-allowed calls stay silent.
+
+Hooks bracket the pipeline. Before the gate, a call passes any registered
+**intercept hooks** (`tools/pre-execute`): the first hook to object bails
+the call and its reason is fed back like a denial. After a real execution,
+`tools/post-execute` fires as a notification; turns are bracketed by
+`agent/turn-start` / `agent/turn-end`. A hook is just a fiber — registering
+a listener or an interceptor is a reversible effect, so unloading the fiber
+retracts the hook (notify dispatch is stc-go's core `On`/`Emit`; intercept
+is the registry satellite — no third dispatch machinery, evaluation filed
+as [stc-go#5](https://github.com/0xdenny218/stc-go/issues/5)).
+
+The system prompt is assembled from fiber-registered **segments**,
+name-sorted and joined with blank lines: the agent ships one identity
+segment, and any fiber can add or retract its own — the next request sees
+the new prompt.
 
 A turn runs `[model → tool]*` until the model answers (the answer streams
 in chunk by chunk; tool calls are traced as `→ name(args)`), with a circuit
@@ -190,7 +208,7 @@ behavior, not the registered name/description.
   framework capabilities grow upstream via reflux. Its **agent** capability
   set takes [dsh](https://github.com/deepseek-ai/deepseek-harness) as the
   reference: hooks, skills, MCP, subagents and compaction are on
-  the roadmap (M7–M9).
+  the roadmap (M8–M9).
 
 ## Milestones
 
@@ -203,7 +221,8 @@ behavior, not the registered name/description.
   (readline, `-p` headless)
 - [x] M6 tool pipeline + approval gate (policy + mid-turn question loop,
   decisions logged as events)
-- [ ] M7 hooks + system-prompt assembly + agent self-inspection
+- [x] M7 hooks (notify + intercept) + system-prompt segments +
+  `inspect_agent` self-description
 - [ ] M8 skills + MCP
 - [ ] M9 subagents + compaction + todos/plan/jobs
 - [ ] M10 tool pack + agent-authored guest tools (evaluation)

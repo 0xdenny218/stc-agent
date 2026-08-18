@@ -6,6 +6,8 @@
 // M5: the session is an event log, the model client is SSE-streaming, and
 // the terminal has readline plus a -p headless mode. M6: every tool call
 // passes an approval gate (policy + mid-turn question loop) before running.
+// M7: hooks (notify + intercept), system prompt assembled from fiber-registered
+// segments, and an inspect_agent tool for self-description.
 package main
 
 import (
@@ -23,9 +25,12 @@ import (
 	"github.com/0xdenny218/stc-agent/internal/cli"
 	"github.com/0xdenny218/stc-agent/internal/config"
 	"github.com/0xdenny218/stc-agent/internal/guest"
+	"github.com/0xdenny218/stc-agent/internal/hooks"
+	"github.com/0xdenny218/stc-agent/internal/inspect"
 	"github.com/0xdenny218/stc-agent/internal/interaction"
 	"github.com/0xdenny218/stc-agent/internal/loop"
 	"github.com/0xdenny218/stc-agent/internal/model"
+	"github.com/0xdenny218/stc-agent/internal/prompt"
 	"github.com/0xdenny218/stc-agent/internal/session"
 	"github.com/0xdenny218/stc-agent/internal/tools"
 	stc "github.com/0xdenny218/stc-go"
@@ -171,6 +176,11 @@ func firstNonEmpty(vs ...string) string {
 	return ""
 }
 
+// identitySegment 是 system prompt 的基础段落（spec M7）：段落注册表按
+// 名字序拼接，更多段落可由 fiber 注册进来（如 "20-style"），这里给的是
+// 装配方自带的身份段。
+const identitySegment = "You are stc-agent, a terminal chat agent built on stc-go where every capability is a fiber. Answer concisely and use the provided tools when they help."
+
 func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) string) int {
 	opts, err := parseOptions(args, getenv)
 	if err != nil {
@@ -185,7 +195,24 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	root := stc.New()
 	defer root.Close()
 
-	_, ctlComp := config.NewControl(root, opts.cfg)
+	boot, cancel := stdctx.WithTimeout(stdctx.Background(), 10*time.Second)
+	defer cancel()
+
+	// fiber 目录最先装载：config 换血与其余启动 fiber 都往里登记
+	// （inspect 工具的 fiber 视图来源）。
+	dirFiber := root.Load(inspect.DirectoryComponent())
+	if err := dirFiber.Ready(boot); err != nil {
+		fmt.Fprintf(stdout, "error: fiber %s: %v\n", dirFiber.Name(), err)
+		return 1
+	}
+	dir, err := stc.Service[*inspect.Directory](root, inspect.KeyDirectory)
+	if err != nil {
+		fmt.Fprintf(stdout, "error: %v\n", err)
+		return 1
+	}
+	dir.Register(dirFiber)
+
+	_, ctlComp := config.NewControl(root, opts.cfg, dir.Register)
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(stdout, "error: %v\n", err)
@@ -211,11 +238,15 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		model.Component(),
 		session.Component(opts.transcript),
 		approval.Component(opts.policy, ia),
+		hooks.Component(),
+		prompt.Component(),
+		prompt.SegmentComponent("10-identity", identitySegment),
 		cli.RegistryComponent(),
 		tools.ToolsetComponent(),
 		tools.ReadFileComponent(),
 		tools.WriteFileComponent(),
 		tools.ShellComponent(cwd, 30*time.Second),
+		inspect.ToolComponent(),
 		guest.RuntimeComponent(),
 	}
 	// guest 工具（spec D5）：tools-dir 里每个 *.wasm 一个工具 fiber，
@@ -240,11 +271,11 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	)
 	fibers := make([]*stc.Fiber, 0, len(comps)+1)
 	for _, c := range comps {
-		fibers = append(fibers, root.Load(c))
+		f := root.Load(c)
+		dir.Register(f) // 目录随启动装配登记；逆在进程退出时无意义，丢弃
+		fibers = append(fibers, f)
 	}
 
-	boot, cancel := stdctx.WithTimeout(stdctx.Background(), 10*time.Second)
-	defer cancel()
 	waitReady := func(f *stc.Fiber) bool {
 		if err := f.Ready(boot); err != nil {
 			fmt.Fprintf(stdout, "error: fiber %s: %v\n", f.Name(), err)
@@ -278,6 +309,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	// cli 最后装载：serve 始于其 Apply。先等全部能力 Ready（guest 工具
 	// 的 wasm 编译较慢），第一轮对话才能看到完整的工具表。
 	cliFiber := root.Load(cli.Component(console))
+	dir.Register(cliFiber)
 	fibers = append(fibers, cliFiber)
 	if !waitReady(cliFiber) {
 		return 1

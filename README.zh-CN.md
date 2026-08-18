@@ -6,8 +6,8 @@
 [stc-go](https://github.com/0xdenny218/stc-go)（时空可组合性范式的 Go 实现）。
 
 > 状态：**v0.1.1 已发布**——`--tools-dir` 里的每个 `*.wasm` 都是 guest
-> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M6 完成（M6：
-> 工具管线 + 审批门）；harness 化路线 M7–M10 见下。
+> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M7 完成（M7：
+> hooks + prompt 段落 + 自描述）；harness 化路线 M8–M10 见下。
 
 ## 安装
 
@@ -61,6 +61,8 @@ REPL 内命令：
 
 - `read_file` / `write_file`——文件读写，输出上限 32 KiB。
 - `shell`——`sh -c` 执行，30 秒超时，工作目录固定为启动目录。
+- `inspect_agent`——自描述：每个 fiber 的实时状态加上当前工具目录，
+  JSON 格式。只读，默认策略放行。
 
 每次工具调用先过审批门再执行。默认策略自动放行 `read_file`，其余一律
 询问；策略可在配置文件里配（`{"approval": {"allow": [...], "deny": [...]}}`——
@@ -78,6 +80,19 @@ REPL 内命令：
 （`-p` headless 模式）门禁 fail-closed：问不了就拒绝。每个经询问得出
 的决定——批准或拒绝——都以 `approval` 事件追加进 transcript，并记录
 来源（`user` / `policy` / `fail-closed`）；策略放行的调用不产生事件。
+
+hooks 包围整条管线。过审批门之前，调用先过已注册的**拦截 hook**
+（`tools/pre-execute`）：第一个提出异议的 hook 阻断调用，理由像拒绝
+一样回灌。真实执行之后，`tools/post-execute` 作为通知触发；轮次由
+`agent/turn-start` / `agent/turn-end` 夹住。hook 就是普通 fiber——
+注册监听或拦截器都是可逆效应，卸载 fiber 即撤销 hook（通知派发用的
+是 stc-go 核心的 `On`/`Emit`，拦截用的是 registry 卫星——不需要第三
+套派发机制，评估记录见
+[stc-go#5](https://github.com/0xdenny218/stc-go/issues/5)）。
+
+system prompt 由 fiber 注册的**段落**组装：按段落名排序、空行拼接。
+agent 自带一个身份段，任何 fiber 都可以增删自己的段落——下一个请求
+就看到新 prompt。
 
 一轮输入按 `[模型 → 工具]*` 迭代直到模型给出答复（答复逐块流式呈现；
 工具调用以 `→ name(args)` 形式打印轨迹），熔断上限 10 次。工具失败
@@ -173,7 +188,7 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
   Cordis——把框架用透到全部要求的那个 agent，框架能力只经回流在上游
   生长。**agent 能力面**以
   [dsh](https://github.com/deepseek-ai/deepseek-harness) 为参照：
-  hooks、skills、MCP、subagent、compaction 在路线图上（M7–M9）。
+  hooks、skills、MCP、subagent、compaction 在路线图上（M8–M9）。
 
 ## 里程碑
 
@@ -184,7 +199,7 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 - [x] M4 发布 + 回流评审（v0.1.0 已上 GitHub；评审产出为 stc-go issues）
 - [x] M5 会话脊柱（事件日志）+ 流式 + 终端交互（readline、`-p` headless）
 - [x] M6 工具管线 + 审批门（策略 + 途中提问回路，决定落事件日志）
-- [ ] M7 hooks + system-prompt 组装 + agent 自描述
+- [x] M7 hooks（通知 + 拦截）+ system-prompt 段落 + `inspect_agent` 自描述
 - [ ] M8 skills + MCP
 - [ ] M9 subagent + compaction + todos/plan/jobs
 - [ ] M10 工具包 + agent 自创作 guest 工具（评估）

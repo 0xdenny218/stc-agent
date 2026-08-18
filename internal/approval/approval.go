@@ -22,10 +22,11 @@ type Policy struct {
 	Deny  []string `json:"deny,omitempty"`
 }
 
-// DefaultPolicy 是内置默认（配置优先级的最底层）：read_file 只读放行；
-// 其余一律询问——询问无门即拒绝，是为 fail-closed（spec D15）。
+// DefaultPolicy 是内置默认（配置优先级的最底层）：read_file 与
+// inspect_agent 只读放行；其余一律询问——询问无门即拒绝，是为
+// fail-closed（spec D15）。
 func DefaultPolicy() Policy {
-	return Policy{Allow: []string{"read_file"}}
+	return Policy{Allow: []string{"read_file", "inspect_agent"}}
 }
 
 func (p Policy) allows(name string) bool { return match(p.Allow, name) }
