@@ -15,12 +15,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
-
 	"github.com/0xdenny218/stc-agent/internal/guest"
 	"github.com/0xdenny218/stc-agent/internal/prompt"
 	"github.com/0xdenny218/stc-agent/internal/tools"
 	stc "github.com/0xdenny218/stc-go"
+	"github.com/0xdenny218/stc-go/watch"
 )
 
 // Skill 是一份 SKILL.md 的解析结果。
@@ -117,17 +116,14 @@ func Component(dir string, onError func(name string, err error), onGone func(nam
 				inverses = append(inverses, inv)
 			}
 
-			fw, err := fsnotify.NewWatcher()
-			if err != nil {
-				return fail(fmt.Errorf("skill %s: watch: %w", name, err))
-			}
-			if err := fw.Add(dir); err != nil {
-				_ = fw.Close()
-				return fail(fmt.Errorf("skill %s: watch: %w", name, err))
-			}
-			done := make(chan struct{})
-			go watchSkill(dir, fw, done, func() { // 编辑热生效
-				b, err := os.ReadFile(mdPath)
+			w, err := watch.Watch(stdctx.Background(), mdPath, watch.Options{OnFire: func(ev watch.Event) {
+				if _, err := os.Stat(mdPath); err != nil { // SKILL.md 消失 → 交给 supervisor 撤退
+					if onGone != nil {
+						onGone(name)
+					}
+					return
+				}
+				b, err := os.ReadFile(mdPath) // 编辑热生效
 				if err != nil {
 					if onError != nil {
 						onError(name, err)
@@ -142,15 +138,13 @@ func Component(dir string, onError func(name string, err error), onGone func(nam
 					return
 				}
 				unregisterSegment = segments.Register("skill:"+name, sk.Body)
-			}, func() { // SKILL.md 消失 → 交给 supervisor 撤退
-				if onGone != nil {
-					onGone(name)
-				}
-			})
+			}})
+			if err != nil {
+				return fail(fmt.Errorf("skill %s: watch: %w", name, err))
+			}
 
 			return func() error {
-				close(done)
-				werr := fw.Close()
+				werr := w.Close()
 				_ = unregisterSegment()
 				var errs []error
 				for _, inv := range inverses {
@@ -159,50 +153,6 @@ func Component(dir string, onError func(name string, err error), onGone func(nam
 				return errors.Join(append([]error{werr}, errs...)...)
 			}, nil
 		},
-	}
-}
-
-// watchSkill 监听 skill 目录里 SKILL.md 的变化（防抖 200ms）：存在即
-// reload，消失即 gone。原子保存（临时文件 + rename）落地为 rename 后
-// 的 create，以事件后 stat 的终态为准，两种形态都安全。
-func watchSkill(dir string, fw *fsnotify.Watcher, done chan struct{}, reload, gone func()) {
-	const debounce = 200 * time.Millisecond
-	var timer *time.Timer
-	var timerC <-chan time.Time
-	fire := func() {
-		if _, err := os.Stat(filepath.Join(dir, "SKILL.md")); err != nil {
-			gone()
-		} else {
-			reload()
-		}
-	}
-	for {
-		select {
-		case <-done:
-			if timer != nil {
-				timer.Stop()
-			}
-			return
-		case ev, ok := <-fw.Events:
-			if !ok {
-				return
-			}
-			if filepath.Base(ev.Name) != "SKILL.md" {
-				continue
-			}
-			if timer != nil {
-				timer.Stop()
-			}
-			timer = time.NewTimer(debounce)
-			timerC = timer.C
-		case _, ok := <-fw.Errors:
-			if !ok {
-				return
-			}
-		case <-timerC:
-			timerC = nil
-			fire()
-		}
 	}
 }
 
@@ -219,14 +169,6 @@ func SupervisorComponent(root *stc.Context, dir string, onError func(name string
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				return nil, fmt.Errorf("skills dir: %w", err)
 			}
-			fw, err := fsnotify.NewWatcher()
-			if err != nil {
-				return nil, fmt.Errorf("skills watch: %w", err)
-			}
-			if err := fw.Add(dir); err != nil {
-				_ = fw.Close()
-				return nil, fmt.Errorf("skills watch: %w", err)
-			}
 			s := &supervisor{
 				root:     root,
 				dir:      dir,
@@ -236,14 +178,19 @@ func SupervisorComponent(root *stc.Context, dir string, onError func(name string
 				gone:     make(chan string, 8),
 				done:     make(chan struct{}),
 			}
+			w, err := watch.Watch(stdctx.Background(), dir, watch.Options{OnFire: func(ev watch.Event) { s.rescan() }})
+			if err != nil {
+				return nil, fmt.Errorf("skills watch: %w", err)
+			}
+			s.w = w
 			// 启动期坏 skill 遵循 tools.d 惯例：fail-fast。
 			for _, name := range s.scan() {
 				if err := s.load(name, true); err != nil {
-					_ = fw.Close()
+					_ = w.Close()
 					return nil, err
 				}
 			}
-			go s.loop(fw)
+			go s.loop()
 			return s.close, nil
 		},
 	}
@@ -260,6 +207,7 @@ type supervisor struct {
 	onError  func(string, error)
 	onChange func(string, bool)
 
+	w      *watch.Watcher // 目录监听（防抖 fire → rescan）
 	mu     sync.Mutex
 	loaded map[string]*skillEntry
 	gone   chan string // skill fiber 上报"SKILL.md 消失"
@@ -364,62 +312,45 @@ func (s *supervisor) remove(name string) {
 	}
 }
 
-// loop 事件主循环：目录事件防抖后全量扫描做 diff（增装、退卸），
-// 外加 skill fiber 自报的 gone。防抖合并原子保存/批量操作的连发。
-func (s *supervisor) loop(fw *fsnotify.Watcher) {
-	const debounce = 200 * time.Millisecond
-	var timer *time.Timer
-	var timerC <-chan time.Time
-	rescan := func() {
-		current := map[string]bool{}
-		for _, name := range s.scan() {
-			current[name] = true
-			_ = s.load(name, false)
-		}
-		s.mu.Lock()
-		var stale []string
-		for name := range s.loaded {
-			if !current[name] {
-				stale = append(stale, name)
-			}
-		}
-		s.mu.Unlock()
-		for _, name := range stale {
-			s.remove(name)
+// rescan 全量扫描做 diff：增装、退卸。目录事件的防抖与终态 fire 已
+// 交给 watch 原语，此处只在 fire 后执行——原子保存/批量操作的连发
+// 已被防抖合并。
+func (s *supervisor) rescan() {
+	current := map[string]bool{}
+	for _, name := range s.scan() {
+		current[name] = true
+		_ = s.load(name, false)
+	}
+	s.mu.Lock()
+	var stale []string
+	for name := range s.loaded {
+		if !current[name] {
+			stale = append(stale, name)
 		}
 	}
+	s.mu.Unlock()
+	for _, name := range stale {
+		s.remove(name)
+	}
+}
+
+// loop 收流 skill fiber 自报的 gone（各自 watcher 发现 SKILL.md 消失），
+// 与目录删除走同一条撤退路径。
+func (s *supervisor) loop() {
 	for {
 		select {
 		case <-s.done:
-			if timer != nil {
-				timer.Stop()
-			}
 			return
 		case name := <-s.gone:
 			s.remove(name)
-		case _, ok := <-fw.Events:
-			if !ok {
-				return
-			}
-			if timer != nil {
-				timer.Stop()
-			}
-			timer = time.NewTimer(debounce)
-			timerC = timer.C
-		case _, ok := <-fw.Errors:
-			if !ok {
-				return
-			}
-		case <-timerC:
-			timerC = nil
-			rescan()
 		}
 	}
 }
 
-// close 是组件逆：停 watcher 与主循环，撤退全部 skill fiber。
+// close 是组件逆：停监听与主循环，撤退全部 skill fiber。
 func (s *supervisor) close() error {
 	close(s.done)
+	_ = s.w.Close()
 	s.mu.Lock()
 	names := make([]string, 0, len(s.loaded))
 	for name := range s.loaded {

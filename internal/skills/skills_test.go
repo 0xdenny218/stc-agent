@@ -30,7 +30,7 @@ func ready(t *testing.T, f *stc.Fiber) {
 	}
 }
 
-// waitFor 轮询条件直至成立或超时（fsnotify 事件是异步的）。
+// waitFor 轮询条件直至成立或超时（watch 事件是异步的）。
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
