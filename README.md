@@ -6,10 +6,11 @@
 [stc-go](https://github.com/0xdenny218/stc-go), the Go implementation of the
 spatiotemporal composability paradigm.
 
-> Status: **v0.1.1 released** — every `*.wasm` in `--tools-dir` is a guest
-> tool fiber, hot-swapped in place when you rebuild it, mid-conversation.
-> Milestones M0–M9 done (M9: subagents + compaction + todos/plan/jobs);
-> the harness roadmap (M10) is below.
+> Status: **v0.2.0 released — M0–M10 done.** Two flagship tricks, both
+> mid-conversation with no restart, no lost session: rebuild a `*.wasm` in
+> `--tools-dir` and the next turn uses the new version; or let the model
+> write its own tool (`define_guest`) — the host compiles the Go source
+> with TinyGo and loads it as a live tool, same turn.
 
 ## Install
 
@@ -40,11 +41,15 @@ Config precedence: built-in defaults < config file < environment < flags.
 | `--resume PATH` | — | alias of `--transcript` |
 | `--tools-dir DIR` | — | `tools.d`; every `*.wasm` in it is a guest tool |
 | `--skills-dir DIR` | — | `skills.d`; every `<name>/SKILL.md` hot-loads as a skill fiber |
+| `--spill-dir DIR` | — | `spill`; where the `spill` tool writes scratch files |
+| `--authored-dir DIR` | — | `<tools-dir>/authored`; sources and builds of model-authored guest tools |
+| `--tinygo PATH` | — | `tinygo` (from PATH); the compiler `define_guest` uses |
 | `--mcp SPEC` | — | MCP stdio server as `name=command args...` (repeatable) |
 | `--config PATH` | — | `~/.config/stc-agent/config.json` if present |
 | `-p, --print TEXT` | — | run a single turn non-interactively, print the answer, exit 0 |
 | `--allow LIST` | — | comma-separated tool names to auto-approve (`*` = all); appended to the policy |
 | `--compact-threshold N` | — | `100000`; compact history when a turn's prompt tokens exceed N (0 disables) |
+| — | `STC_AGENT_WEB_SEARCH_URL` | DuckDuckGo Instant Answer template (`{q}` = query); swap in any search backend |
 
 On a terminal the REPL has readline line editing with history (plain line
 reads when stdin is piped). Model answers stream in as they arrive.
@@ -69,11 +74,21 @@ the first completed reflux cycle: the pattern repeated here twice, was
 extracted upstream, and this repo deleted its own copies):
 
 - `read_file` / `write_file` — filesystem access, 32 KiB output cap.
+- `edit` / `glob` / `grep` — exact-string edit, glob with `**` recursion,
+  regex search with `path:line:` output (binary files skipped) (M10).
 - `shell` — `sh -c` with a 30s timeout, working directory pinned to the
   launch directory.
 - `inspect_agent` — self-description: every fiber's live state plus the
   current tool catalog, as JSON. Read-only, auto-approved by the default
   policy.
+- `spill` — write a scratch file (drafts, notes, artifacts) into
+  `--spill-dir`; single-segment names only (M10).
+- `session_title` — label the session; lands as a `title` event in the
+  log, replay restores the latest (M10).
+- `web_fetch` / `web_search` — fetch a URL / search the web behind one
+  SSRF-guarded core (M10).
+- `define_guest` — write a Go guest tool; the host compiles it with
+  TinyGo and loads it as a regular tool (M10).
 - `task` — spawn a sub-agent on a self-contained prompt; its final answer
   flows back as the tool result (M9).
 - `todo_write` — maintain a task list rendered into the system prompt (M9).
@@ -82,7 +97,8 @@ extracted upstream, and this repo deleted its own copies):
   sub-agents, enumerable and killable (M9).
 
 Every tool call passes an approval gate before it runs. The default policy
-auto-approves `read_file` and asks about everything else; configure it in
+auto-approves the read-only set (`read_file`, `inspect_agent`, `glob`,
+`grep`) and asks about everything else; configure it in
 the config file (`{"approval": {"allow": [...], "deny": [...]}}` — a file
 policy replaces the default) or with `--allow`. The deny list wins over the
 allow list; a tool matched by neither asks. A question suspends the turn
@@ -257,6 +273,52 @@ completion lands as a user message at the next model call, while
 `job_list` enumerates and `job_kill` cancels. Shell and sub-agent
 background work converge on one lifecycle (the `task` path).
 
+## Tool pack, web tools, agent-authored guest tools (M10)
+
+**Tool pack**: `edit` does exact-string replacement — a missing `old_string`
+or an ambiguous one (multiple hits without `replace_all`) is an error fed
+back to the model to correct, not a silent partial write. `glob` supports
+`**` across directory levels; `grep` prints `path:line: content`, skips
+binary files, and requires `recursive=true` to walk a directory. `spill`
+writes scratch files into `--spill-dir` (single-segment names only — no
+path traversal). `session_title` labels the session as a `title` event in
+the log; replay restores the latest.
+
+**Web**: `web_fetch` and `web_search` share one fetch core — http/https
+only, SSRF-guarded (private/loopback/link-local targets are blocked, and a
+failed lookup counts as blocked), 1 MiB body cap with truncation, binary
+bodies rejected. `web_search` hits the key-free DuckDuckGo Instant Answer
+endpoint by default; `STC_AGENT_WEB_SEARCH_URL` swaps in any `{q}`
+endpoint template. Both are remote tools, so the default policy asks.
+
+**`define_guest` — the model writes its own tools.** The model passes a
+name and a complete Go source; the host compiles it with TinyGo
+(`--tinygo`) and loads it through the same `guest.Load` path as
+`--tools-dir` — hot reload, the approval gate, and rollback all come
+along. Sources and builds land in `--authored-dir` (default
+`<tools-dir>/authored`, kept apart from hand-dropped wasms so boot
+scanning never double-loads them). Failure rolls back cleanly: the wasm is
+deleted, nothing leaks into the toolset, and the source stays on disk so
+the model can retry. Re-defining a name swaps the tool in place.
+
+A real run (2026-08-18, GLM `glm-4.5` via their Coding Plan endpoint —
+asked to define a `shout` tool that upper-cases `{"text": ...}`):
+
+```
+→ define_guest({"name": "shout", "source": "package main\n
+    import (\"encoding/json\"; \"github.com/0xdenny218/stc-go/guest\"; \"strings\")\n
+    init(): guest.OnInvoke(unmarshal {\"text\"} → strings.ToUpper)\n
+    start(): guest.Provide(\"tool.shout\", {...})..."})
+tool result: guest tool "shout" defined and loaded (source kept at tools.d/authored/shout.go)
+```
+
+The model wrote a correct guest in one shot (JSON parse, `OnInvoke`,
+`Provide` with the descriptor); the host compiled and loaded it, and the
+next request advertised `shout` like any built-in. The E2E
+(`TestE2EAuthoredGuestTool`, real TinyGo) drives the whole loop against a
+scripted model: define → invoke → wasm-sourced result, plus the rollback
+contracts (compile failure leaves no residue, source kept for retry).
+
 ## What it is
 
 - A CLI chat agent (stdin/stdout) with a streaming tool-calling loop.
@@ -283,7 +345,8 @@ background work converge on one lifecycle (the `task` path).
   set takes [dsh](https://github.com/deepseek-ai/deepseek-harness) as the
   reference: hooks, skills and MCP are done (M7–M8); subagents, compaction,
   todos, plan mode and background jobs are done (M9); the tool pack and
-  agent-authored guest tools are on the roadmap (M10).
+  agent-authored guest tools are done (M10). The harness roadmap is
+  complete.
 
 ## Milestones
 
@@ -303,7 +366,9 @@ background work converge on one lifecycle (the `task` path).
   vanish)
 - [x] M9 subagents (child scopes) + compaction + todos + plan mode +
   background jobs (shell and sub-agent, one lifecycle)
-- [ ] M10 tool pack + agent-authored guest tools (evaluation)
+- [x] M10 tool pack (edit/glob/grep, spill, session_title) + web tools
+  (SSRF-guarded `web_fetch`/`web_search`) + agent-authored guest tools
+  (`define_guest`: model-written source → TinyGo compile → load; v0.2.0)
 
 ## Development
 

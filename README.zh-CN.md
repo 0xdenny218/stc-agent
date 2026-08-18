@@ -5,9 +5,10 @@
 **万物皆插件的最小 CLI 对话 agent**——基于
 [stc-go](https://github.com/0xdenny218/stc-go)（时空可组合性范式的 Go 实现）。
 
-> 状态：**v0.1.1 已发布**——`--tools-dir` 里的每个 `*.wasm` 都是 guest
-> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M9 完成（M9：
-> subagent + compaction + todos/plan/jobs）；harness 化路线 M10 见下。
+> 状态：**v0.2.0 已发布——M0–M10 全部完成。** 两个旗舰演示都在对话进行中、
+> 不重启、不丢会话：原地重建 `--tools-dir` 里的 `*.wasm`，下一轮即走新
+> 版本；或让模型自写工具（`define_guest`）——宿主用 TinyGo 把 Go 源码
+> 编译装载为活工具，同轮可用。
 
 ## 安装
 
@@ -38,11 +39,15 @@ go run ./cmd/stc-agent -p "explain this repo"   # 一次性：打印答复后退
 | `--resume PATH` | — | `--transcript` 的别名 |
 | `--tools-dir DIR` | — | `tools.d`；其中每个 `*.wasm` 是一个 guest 工具 |
 | `--skills-dir DIR` | — | `skills.d`；其中每个 `<name>/SKILL.md` 热装载为一个 skill fiber |
+| `--spill-dir DIR` | — | `spill`；`spill` 工具写草稿文件的目录 |
+| `--authored-dir DIR` | — | `<tools-dir>/authored`；模型自创作 guest 的源码与产物 |
+| `--tinygo PATH` | — | `tinygo`（取自 PATH）；`define_guest` 用的编译器 |
 | `--mcp SPEC` | — | MCP stdio server，形如 `name=command args...`（可重复） |
 | `--config PATH` | — | `~/.config/stc-agent/config.json`（存在才读） |
 | `-p, --print TEXT` | — | 非交互跑单轮：打印答复，exit 0 |
 | `--allow LIST` | — | 逗号分隔的免审批工具名（`*` = 全部）；追加进策略 |
 | `--compact-threshold N` | — | `100000`；一轮 prompt tokens 超过 N 即压缩历史（0 关闭） |
+| — | `STC_AGENT_WEB_SEARCH_URL` | DuckDuckGo Instant Answer 模板（`{q}` = 查询）；可换任意搜索后端 |
 
 在终端里 REPL 有 readline 行编辑与历史（stdin 是管道时退回普通逐行
 读取）。模型答复逐块流式呈现。Ctrl-C 中断当前轮而不杀会话（在提示符
@@ -65,16 +70,27 @@ REPL 内命令：
 副本）：
 
 - `read_file` / `write_file`——文件读写，输出上限 32 KiB。
+- `edit` / `glob` / `grep`——精确字符串替换、支持 `**` 跨层的 glob、
+  正则搜索（`path:line:` 输出、跳过二进制）（M10）。
 - `shell`——`sh -c` 执行，30 秒超时，工作目录固定为启动目录。
 - `inspect_agent`——自描述：每个 fiber 的实时状态加上当前工具目录，
   JSON 格式。只读，默认策略放行。
+- `spill`——往 `--spill-dir` 写草稿文件（笔记/产物暂存）；文件名单段
+  限制（M10）。
+- `session_title`——给会话起标题；落为日志里的 `title` 事件，replay
+  恢复最新标题（M10）。
+- `web_fetch` / `web_search`——抓 URL / 搜网络，共用一个带 SSRF 门的
+  抓取核心（M10）。
+- `define_guest`——写一个 Go guest 工具；宿主用 TinyGo 编译并装载为
+  普通工具（M10）。
 - `task`——派生子 agent 处理一条自包含指令，终答作为工具结果回流（M9）。
 - `todo_write`——维护任务清单，渲染进 system prompt（M9）。
 - `exit_plan_mode`——提出计划，获批后退出 plan 模式（M9）。
 - `job_start` / `job_list` / `job_kill`——后台 shell 命令或子 agent，
   可列可杀（M9）。
 
-每次工具调用先过审批门再执行。默认策略自动放行 `read_file`，其余一律
+每次工具调用先过审批门再执行。默认策略自动放行只读集合
+（`read_file`、`inspect_agent`、`glob`、`grep`），其余一律
 询问；策略可在配置文件里配（`{"approval": {"allow": [...], "deny": [...]}}`——
 文件策略整体替换默认）或用 `--allow` 追加。deny 名单优先于 allow
 名单；两边都不命中的工具走询问。询问会把轮次挂起在工具循环中途：
@@ -229,6 +245,45 @@ agent 请你批准：yes 关模式并把计划回灌，no 留在模式。每个�
 `job_list` 枚举、`job_kill` 取消。shell 与子 agent 后台工作收敛到同
 一条生命周期（`task` 通路）。
 
+## 工具包、网络工具、agent 自创作 guest（M10）
+
+**工具包**：`edit` 做精确字符串替换——`old_string` 未命中或多次命中
+（没给 `replace_all`）都报错回灌给模型纠正，绝不静默半写。`glob` 支持
+`**` 跨目录层；`grep` 输出 `path:line: 内容`、跳过二进制文件、搜目录
+需 `recursive=true`。`spill` 往 `--spill-dir` 写草稿（文件名单段限制，
+杜绝路径穿越）。`session_title` 给会话起标题，落为日志里的 `title`
+事件；replay 恢复最新标题。
+
+**网络**：`web_fetch` 与 `web_search` 共用一个抓取核心——仅 http/https、
+SSRF 门（私网/回环/链路本地一律拒、解析失败按阻断处理）、1 MiB 上限
+截断、二进制拒收。`web_search` 默认打 DuckDuckGo Instant Answer 免 key
+端点；`STC_AGENT_WEB_SEARCH_URL` 可换任意 `{q}` 模板后端。二者都是远程
+工具，默认策略要询问。
+
+**`define_guest`——模型自写工具。** 模型传一个名字加完整 Go 源码；
+宿主用 TinyGo（`--tinygo`）编译，经与 `--tools-dir` 完全相同的
+`guest.Load` 通路装载——热重载、审批门、失败回卷全部顺带继承。源码与
+产物落在 `--authored-dir`（默认 `<tools-dir>/authored`，与手工摆放的
+wasm 分开，启动扫描不会重复装载）。失败干净回卷：wasm 删除、toolset
+不留残项、源码保留在盘上供模型重试。同名重定义原地换血。
+
+一次真实运行（2026-08-18，GLM `glm-4.5` 走其 Coding Plan 端点——
+让它定义一个把 `{"text": ...}` 大写返回的 `shout` 工具）：
+
+```
+→ define_guest({"name": "shout", "source": "package main\n
+    import (\"encoding/json\"; \"github.com/0xdenny218/stc-go/guest\"; \"strings\")\n
+    init(): guest.OnInvoke(解析 {\"text\"} → strings.ToUpper)\n
+    start(): guest.Provide(\"tool.shout\", {...})..."})
+tool result: guest tool "shout" defined and loaded (source kept at tools.d/authored/shout.go)
+```
+
+模型一次写出正确 guest（JSON 解析、`OnInvoke`、带描述符的 `Provide`）；
+宿主编译装载，下一个请求像内置工具一样把 `shout` 列进工具表。E2E
+（`TestE2EAuthoredGuestTool`，真实 TinyGo）对着脚本化模型驱动整个闭环：
+定义 → 调用 → 结果真实来自 wasm，外加回卷契约（编译失败无残项、源码
+保留可重试）。
+
 ## 是什么
 
 - CLI 对话 agent（stdin/stdout），带流式工具调用循环。
@@ -252,8 +307,8 @@ agent 请你批准：yes 关模式并把计划回灌，no 留在模式。每个�
   生长。**agent 能力面**以
   [dsh](https://github.com/deepseek-ai/deepseek-harness) 为参照：
   hooks、skills、MCP 已完成（M7–M8）；subagent、compaction、todos、
-  plan 模式与后台任务已完成（M9）；工具包与 agent 自创作 guest 工具在
-  路线图上（M10）。
+  plan 模式与后台任务已完成（M9）；工具包与 agent 自创作 guest 工具已
+  完成（M10）。harness 化路线收官。
 
 ## 里程碑
 
@@ -269,7 +324,9 @@ agent 请你批准：yes 关模式并把计划回灌，no 留在模式。每个�
   + MCP stdio server 工具 fiber（断开 = 工具失效）
 - [x] M9 subagent（子作用域）+ compaction + todos + plan 模式 + 后台任务
   （shell 与子 agent，同一条生命周期）
-- [ ] M10 工具包 + agent 自创作 guest 工具（评估）
+- [x] M10 工具包（edit/glob/grep、spill、session_title）+ 网络工具
+  （带 SSRF 门的 `web_fetch`/`web_search`）+ agent 自创作 guest
+  （`define_guest`：模型写源码 → TinyGo 编译 → 装载；v0.2.0）
 
 ## 开发
 
