@@ -53,7 +53,7 @@ func HelpCommandComponent() stc.Component {
 				for _, n := range reg.Names() {
 					fmt.Fprintf(w, "  /%s\n", n)
 				}
-				fmt.Fprintln(w, "  /quit")
+				fmt.Fprintln(w, "  /quit (or plain quit/exit)")
 				return nil
 			}), nil
 		},

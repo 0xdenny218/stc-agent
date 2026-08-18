@@ -184,6 +184,69 @@ func TestStreamAssembly(t *testing.T) {
 	}
 }
 
+// TestThinkFilter 直测思考段过滤器：标记被分片边界劈开也不泄漏，孤立
+// </think> 剥除，字面尾巴收尾放出（GLM 冒烟实录的两种泄漏形态）。
+func TestThinkFilter(t *testing.T) {
+	run := func(chunks []string) string {
+		var f thinkFilter
+		var got strings.Builder
+		for _, c := range chunks {
+			got.WriteString(f.feed(c))
+		}
+		got.WriteString(f.flush())
+		return got.String()
+	}
+	for _, tc := range []struct {
+		name   string
+		chunks []string
+		want   string
+	}{
+		{"plain", []string{"hello world"}, "hello world"},
+		{"full block in one chunk", []string{"<think>draft</think>answer"}, "answer"},
+		{"marker split across chunks", []string{"<th", "ink>dr", "aft</th", "ink>answer"}, "answer"},
+		{"orphan close marker", []string{"第一段</th", "ink>第二段"}, "第一段第二段"},
+		{"orphan close in one chunk", []string{"a</think>b"}, "ab"},
+		{"multiple blocks", []string{"a<think>1</think>b", "<thi", "nk>2</think>c"}, "abc"},
+		{"literal tail held then flushed", []string{"x<thi"}, "x<thi"},
+		{"unterminated think suppressed", []string{"a<think>reasoning never ends"}, "a"},
+		{"reopen after orphan close", []string{"</think>a<think>x</think>b"}, "ab"},
+	} {
+		if got := run(tc.chunks); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Contract/ThinkStripped：内联思考段在客户端层就被净化——入库消息与
+// onDelta 流都只含可见文本。
+func TestStreamThinkStripped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sseLines(w,
+			`{"choices":[{"delta":{"role":"assistant"}}]}`,
+			`{"choices":[{"delta":{"content":"<think>hid"}}]}`,
+			`{"choices":[{"delta":{"content":"den</think>ans"}}]}`,
+			`{"choices":[{"delta":{"content":"wer"}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			`[DONE]`,
+		)
+	}))
+	defer srv.Close()
+
+	var deltas []string
+	c := NewClient(srv.URL, "k", "m1", time.Second)
+	resp, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "x"}}},
+		func(d string) { deltas = append(deltas, d) })
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if resp.Message.Content != "answer" {
+		t.Fatalf("content must be stripped of the think block: %q", resp.Message.Content)
+	}
+	if got := strings.Join(deltas, ""); got != "answer" {
+		t.Fatalf("onDelta stream must be stripped too: %q (deltas %q)", got, deltas)
+	}
+}
+
 // Contract/ChatTools：tools 请求的线格式（spec M2；OpenAI 工具调用协议）。
 func TestChatClientTools(t *testing.T) {
 	var gotBody wireRequest

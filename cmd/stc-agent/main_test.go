@@ -299,6 +299,24 @@ func TestRunRequiresAPIKey(t *testing.T) {
 	}
 }
 
+// 退出别名：裸 exit/quit 与 /exit 等同 /quit——直接退出（exit 0），
+// 不发给模型（用户实录里 "exit" 被当成消息回了一句"再见"）。
+func TestQuitAliases(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, line := range []string{"exit", "quit", "/exit", "/quit"} {
+		t.Run(line, func(t *testing.T) {
+			write, _, waitExit := serveIn(t, []string{
+				"--api-key", "test",
+				"--base-url", "http://127.0.0.1:1", // 不会被联系到
+			})
+			write(line + "\n")
+			if code := waitExit(); code != 0 {
+				t.Fatalf("exit code %d", code)
+			}
+		})
+	}
+}
+
 // E2E/ToolCallLoop：mock 先要求 read_file，再给出最终答复。断言：
 //   - stdout 出现工具轨迹 "→ read_file(...)" 与流式组装出的最终答复；
 //   - 第二次请求携带 3 条消息（user/assistant/tool），tool 消息内容为文件

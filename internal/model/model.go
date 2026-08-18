@@ -238,11 +238,87 @@ func mapErr(err error, ctx stdctx.Context) error {
 	return &ChatError{Kind: KindTransport, Err: err}
 }
 
+// thinkFilter 净化流式 content 中的内联思考段（GLM 真实冒烟发现）：
+// 推理模型偶发把思考内联进 content——完整 "<think>...</think>" 段，或
+// 孤立的 "</think>" 过渡标记（思考走了 reasoning_content、只剩收尾
+// 标记落进 content）。增量流上的小型状态机：思考段整体抑制；孤立收尾
+// 标记剥除；可能构成标记前缀的分片尾巴暂扣，待下一分片或收尾再判定——
+// 分片边界劈开标记也不泄漏。
+type thinkFilter struct {
+	inThink bool
+	pending string
+}
+
+const (
+	thinkOpen  = "<think>"
+	thinkClose = "</think>"
+)
+
+// feed 处理一个 content 分片，返回可见文本（可为空）。
+func (f *thinkFilter) feed(s string) string {
+	s = f.pending + s
+	f.pending = ""
+	var out strings.Builder
+	for {
+		if f.inThink {
+			i := strings.Index(s, thinkClose)
+			if i < 0 {
+				f.pending = holdMarkerPrefix(s, thinkClose)
+				return out.String()
+			}
+			s = s[i+len(thinkClose):]
+			f.inThink = false
+			continue
+		}
+		o, c := strings.Index(s, thinkOpen), strings.Index(s, thinkClose)
+		switch {
+		case c >= 0 && (o < 0 || c < o): // 孤立收尾标记：只剥标记本身
+			out.WriteString(s[:c])
+			s = s[c+len(thinkClose):]
+		case o >= 0: // 思考段开始：此后整体抑制
+			out.WriteString(s[:o])
+			s = s[o+len(thinkOpen):]
+			f.inThink = true
+		default: // 无完整标记：暂扣可能是标记前缀的尾巴
+			f.pending = holdMarkerPrefix(s, thinkOpen, thinkClose)
+			out.WriteString(s[:len(s)-len(f.pending)])
+			return out.String()
+		}
+	}
+}
+
+// flush 在流收尾时调用：思考段外的暂扣尾巴是字面文本（没有后续分片能
+// 补全标记了），放出；思考段内的尾巴随段一并吞掉。
+func (f *thinkFilter) flush() string {
+	p := f.pending
+	f.pending = ""
+	if f.inThink {
+		return ""
+	}
+	return p
+}
+
+// holdMarkerPrefix 返回 s 的最长后缀，要求它是任一标记的真前缀（完整
+// 标记已在上面的分支处理，不会走到这里）。
+func holdMarkerPrefix(s string, markers ...string) string {
+	best := 0
+	for _, m := range markers {
+		for n := len(m) - 1; n > best; n-- {
+			if len(s) >= n && s[len(s)-n:] == m[:n] {
+				best = n
+				break
+			}
+		}
+	}
+	return s[len(s)-best:]
+}
+
 // assembler 把 SSE 增量分片组装成完整应答：content 追加、tool_calls 按
 // index 归位（各字段分片追加）、finish_reason 与收尾 usage 记录。
 type assembler struct {
 	onDelta      func(string)
 	content      strings.Builder
+	think        thinkFilter
 	toolCalls    []ToolCall
 	role         string
 	finishReason string
@@ -295,9 +371,12 @@ func (a *assembler) handleLine(line []byte) (done bool, err error) {
 			a.role = d.Role
 		}
 		if d.Content != "" {
-			a.content.WriteString(d.Content)
-			if a.onDelta != nil {
-				a.onDelta(d.Content)
+			visible := a.think.feed(d.Content)
+			if visible != "" {
+				a.content.WriteString(visible)
+				if a.onDelta != nil {
+					a.onDelta(visible)
+				}
 			}
 		}
 		for _, dt := range d.ToolCalls {
@@ -323,6 +402,13 @@ func (a *assembler) handleLine(line []byte) (done bool, err error) {
 }
 
 func (a *assembler) result() (*ChatResponse, error) {
+	// 收尾放出思考段外暂扣的字面尾巴（如恰好停在 "<thi" 的分片）。
+	if tail := a.think.flush(); tail != "" {
+		a.content.WriteString(tail)
+		if a.onDelta != nil {
+			a.onDelta(tail)
+		}
+	}
 	if !a.sawChunk {
 		return nil, &ChatError{Kind: KindProtocol, Err: errors.New("stream ended without chunks")}
 	}

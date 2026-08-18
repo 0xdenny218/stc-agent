@@ -213,7 +213,7 @@ func serve(ctx stdctx.Context, console *Console, r loop.Runner, reg *Registry, e
 			line = strings.TrimSpace(line)
 			switch {
 			case line == "":
-			case line == "/quit":
+			case line == "/quit" || line == "quit" || line == "exit" || line == "/exit":
 				console.signalDone()
 				return
 			case strings.HasPrefix(line, "/"):
