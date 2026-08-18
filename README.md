@@ -8,7 +8,7 @@ spatiotemporal composability paradigm.
 
 > Status: **v0.1.0 released** — every `*.wasm` in `--tools-dir` is a guest
 > tool fiber, hot-swapped in place when you rebuild it, mid-conversation.
-> All milestones done (M0–M4).
+> Milestones M0–M4 done; the harness roadmap (M5–M9) is below.
 
 ## Install
 
@@ -149,11 +149,15 @@ behavior, not the registered name/description.
 
 ## Non-goals
 
-- No UI/TUI/web. No framework abstractions — patterns get extracted only
-  after they repeat in the agent.
-- Not a [dsh](https://github.com/deepseek-ai/deepseek-harness) competitor:
-  no streaming, no provider abstraction layer, no MCP/skills/subagents, no
-  permission pipeline.
+- No UI/TUI/web, no provider abstraction layer, no sandboxed execution.
+- No framework ambitions of its own: no plugin distribution, no profile
+  composition, no second-development platform. stc-agent is to
+  [stc-go](https://github.com/0xdenny218/stc-go) what dsh is to Cordis —
+  the agent that exercises the framework to its full requirements, so that
+  framework capabilities grow upstream via reflux. Its **agent** capability
+  set takes [dsh](https://github.com/deepseek-ai/deepseek-harness) as the
+  reference: streaming, approvals, hooks, skills, MCP, subagents and
+  compaction are on the roadmap (M5–M9).
 
 ## Milestones
 
@@ -162,6 +166,11 @@ behavior, not the registered name/description.
 - [x] M2 tool system + agent loop (toolset as stable service, static Go tools)
 - [x] M3 WASM guest tools + hot reload (hmr): mid-conversation tool swap
 - [x] M4 release + satellite-package review (v0.1.0 on GitHub; the review is filed as stc-go issues)
+- [ ] M5 session spine (event log + projections) + streaming
+- [ ] M6 tool pipeline + approval gate
+- [ ] M7 hooks + system-prompt assembly
+- [ ] M8 skills + MCP
+- [ ] M9 subagents + compaction
 
 ## Development
 

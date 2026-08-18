@@ -6,7 +6,8 @@
 [stc-go](https://github.com/0xdenny218/stc-go)（时空可组合性范式的 Go 实现）。
 
 > 状态：**v0.1.0 已发布**——`--tools-dir` 里的每个 `*.wasm` 都是 guest
-> 工具 fiber，原地重建即在对话进行中热替换。里程碑全部完成（M0–M4）。
+> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M4 完成；
+> harness 化路线 M5–M9 见下。
 
 ## 安装
 
@@ -141,9 +142,13 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 
 ## 不做
 
-- 不做 UI/TUI/web；不做框架抽象——模式在 agent 里重复出现后再抽取。
-- 不是 [dsh](https://github.com/deepseek-ai/deepseek-harness) 竞品：
-  不做流式输出、provider 抽象层、MCP/skills/subagent、权限审批流。
+- 不做 UI/TUI/web；不做 provider 抽象层；不做 sandbox 隔离执行。
+- 自身不做框架：不做插件分发、profile 组合与二次开发平台。stc-agent
+  之于 [stc-go](https://github.com/0xdenny218/stc-go) 正如 dsh 之于
+  Cordis——把框架用透到全部要求的那个 agent，框架能力只经回流在上游
+  生长。**agent 能力面**以
+  [dsh](https://github.com/deepseek-ai/deepseek-harness) 为参照：流式、
+  审批、hooks、skills、MCP、subagent、compaction 在路线图上（M5–M9）。
 
 ## 里程碑
 
@@ -152,6 +157,11 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 - [x] M2 工具系统 + agent 循环（toolset 稳定服务、静态 Go 工具）
 - [x] M3 WASM guest 工具 + 热重载（hmr）：对话中途换工具
 - [x] M4 发布 + 回流评审（v0.1.0 已上 GitHub；评审产出为 stc-go issues）
+- [ ] M5 会话脊柱（事件日志 + 投影）+ 流式
+- [ ] M6 工具管线 + 审批门
+- [ ] M7 hooks + system-prompt 组装
+- [ ] M8 skills + MCP
+- [ ] M9 subagent + compaction
 
 ## 开发
 
