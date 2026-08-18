@@ -5,19 +5,30 @@
 **万物皆插件的最小 CLI 对话 agent**——基于
 [stc-go](https://github.com/0xdenny218/stc-go)（时空可组合性范式的 Go 实现）。
 
-> 状态：**v0.2.0 已发布——M0–M10 全部完成。** 两个旗舰演示都在对话进行中、
+> 状态：**v0.2.1 已发布——M0–M10 全部完成，一条命令安装。** 两个旗舰演示都在对话进行中、
 > 不重启、不丢会话：原地重建 `--tools-dir` 里的 `*.wasm`，下一轮即走新
 > 版本；或让模型自写工具（`define_guest`）——宿主用 TinyGo 把 Go 源码
 > 编译装载为活工具，同轮可用。
 
 ## 安装
 
+一条命令（macOS/Linux）——下载对应平台的 release 包、校验 sha256、装进
+`~/.local/bin`（`STC_AGENT_INSTALL_DIR` 可覆盖；指定版本：
+`install.sh v0.2.1`）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0xdenny218/stc-agent/main/scripts/install.sh | sh
+```
+
+Windows：到 [releases](https://github.com/0xdenny218/stc-agent/releases) 页
+直接下载 `.zip`。release 包在每个 `v*` tag 上自动附带。装了 Go 的话也可：
+
 ```sh
 go install github.com/0xdenny218/stc-agent/cmd/stc-agent@latest
 ```
 
-或克隆后 `go run ./cmd/stc-agent`。运行 agent 只需要 Go；开发 guest
-工具另需 [TinyGo](https://tinygo.org/)。
+装好的二进制只需要一个 API key；开发 guest 工具（及 `define_guest`）
+另需 [TinyGo](https://tinygo.org/)。
 
 ## 用法
 

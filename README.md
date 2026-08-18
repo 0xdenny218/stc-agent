@@ -6,7 +6,7 @@
 [stc-go](https://github.com/0xdenny218/stc-go), the Go implementation of the
 spatiotemporal composability paradigm.
 
-> Status: **v0.2.0 released — M0–M10 done.** Two flagship tricks, both
+> Status: **v0.2.1 released — M0–M10 done, installable in one command.** Two flagship tricks, both
 > mid-conversation with no restart, no lost session: rebuild a `*.wasm` in
 > `--tools-dir` and the next turn uses the new version; or let the model
 > write its own tool (`define_guest`) — the host compiles the Go source
@@ -14,12 +14,24 @@ spatiotemporal composability paradigm.
 
 ## Install
 
+One command (macOS/Linux) — downloads the release package for your platform,
+verifies its checksum, and installs into `~/.local/bin` (override with
+`STC_AGENT_INSTALL_DIR`; a specific version: `install.sh v0.2.1`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0xdenny218/stc-agent/main/scripts/install.sh | sh
+```
+
+Windows: grab the `.zip` from the [releases](https://github.com/0xdenny218/stc-agent/releases)
+page. Release packages are attached automatically on every `v*` tag. Or, with
+Go installed:
+
 ```sh
 go install github.com/0xdenny218/stc-agent/cmd/stc-agent@latest
 ```
 
-or clone and `go run ./cmd/stc-agent`. Running the agent only needs Go;
-developing guest tools additionally needs [TinyGo](https://tinygo.org/).
+The installed binary needs nothing but an API key; developing guest tools
+(additionally to `define_guest`) needs [TinyGo](https://tinygo.org/).
 
 ## Usage
 
