@@ -53,8 +53,9 @@ Config precedence: built-in defaults < config file < environment < flags.
 
 On a terminal the REPL has readline line editing with history (plain line
 reads when stdin is piped). Model answers stream in as they arrive.
-Ctrl-C interrupts the current turn without killing the session (at the
-prompt it discards the current line); Ctrl-D on an empty line exits.
+Ctrl-C interrupts the current turn without killing the session; at the
+prompt it discards the current line, and pressing it twice in a row exits
+(as does Ctrl-D on an empty line, `/quit`, or a plain `quit`/`exit`).
 
 Commands inside the REPL:
 

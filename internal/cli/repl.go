@@ -143,8 +143,8 @@ func (c *Console) setTurnCancel(cancel stdctx.CancelFunc) {
 	c.turnCancel = cancel
 }
 
-// Done 在会话结束（stdin EOF、/quit 或空闲时 Ctrl-C）时关闭；只关一次，
-// 与重载无关。
+// Done 在会话结束（stdin EOF、/quit、提示符处连按两次 Ctrl-C）时关闭；
+// 只关一次，与重载无关。
 func (c *Console) Done() <-chan struct{} { return c.done }
 
 func (c *Console) signalDone() { c.doneOnce.Do(func() { close(c.done) }) }
@@ -189,6 +189,10 @@ func Component(console *Console) stc.Component {
 func serve(ctx stdctx.Context, console *Console, r loop.Runner, reg *Registry, exited chan<- struct{}) {
 	defer close(exited)
 	w := console.out
+	// 提示符处 Ctrl-C 连按两次直接退出（对齐 Claude Code）：第一次只丢
+	// 当前行并提示，任何成功读入的行都会清零计数。轮次中的 Ctrl-C 走
+	// SIGINT → 中断当前轮，不在此列。
+	aborts := 0
 	for {
 		if console.tty {
 			// 放行输入泵进入 Prompt（轮次执行期间不放行，终端保持熟
@@ -203,13 +207,19 @@ func serve(ctx stdctx.Context, console *Console, r loop.Runner, reg *Registry, e
 		select {
 		case <-ctx.Done():
 			return
-		case <-console.aborts: // 提示符处 Ctrl-C：丢弃当前行，会话继续
-			fmt.Fprintln(w, "^C")
+		case <-console.aborts: // 提示符处 Ctrl-C：丢行；连按两次退出
+			aborts++
+			if aborts >= 2 {
+				console.signalDone()
+				return
+			}
+			fmt.Fprintln(w, "^C (press Ctrl-C again to exit)")
 		case line, ok := <-console.lines:
 			if !ok { // stdin EOF（管道）或 Ctrl-D 空行（终端）
 				console.signalDone()
 				return
 			}
+			aborts = 0
 			line = strings.TrimSpace(line)
 			switch {
 			case line == "":

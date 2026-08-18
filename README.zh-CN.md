@@ -50,8 +50,9 @@ go run ./cmd/stc-agent -p "explain this repo"   # 一次性：打印答复后退
 | — | `STC_AGENT_WEB_SEARCH_URL` | DuckDuckGo Instant Answer 模板（`{q}` = 查询）；可换任意搜索后端 |
 
 在终端里 REPL 有 readline 行编辑与历史（stdin 是管道时退回普通逐行
-读取）。模型答复逐块流式呈现。Ctrl-C 中断当前轮而不杀会话（在提示符
-处则是丢弃当前行）；空行上 Ctrl-D 退出。
+读取）。模型答复逐块流式呈现。Ctrl-C 中断当前轮而不杀会话；在提示符
+处按一次丢弃当前行，连按两次直接退出（空行 Ctrl-D、/quit 或裸
+quit/exit 同样退出）。
 
 REPL 内命令：
 
