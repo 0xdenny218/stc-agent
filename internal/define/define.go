@@ -69,7 +69,7 @@ func Component(opts Options) stc.Component {
 			ld := &loader{opts: o, c: c, guests: map[string]stc.Inverse{}}
 			untool := ts.Register("define_guest", tools.Tool{
 				Name:        "define_guest",
-				Description: "Define a new tool by writing its Go source. The host compiles it with TinyGo to wasm and loads it as a regular tool. Source contract: package main; import github.com/0xdenny218/stc-go/guest; in init() call guest.OnInvoke(func(args string) string); export func start() which calls guest.Provide(\"tool.<name>\", <json descriptor>) where <name> equals the name you pass here. Re-defining a name replaces the existing tool.",
+				Description: "Define a new tool by writing its Go source. The host compiles it with TinyGo to wasm and loads it as a regular tool. Source contract: package main; import github.com/0xdenny218/stc-go/guest; in init() call guest.OnInvoke(func(args string) string); export func start() which calls guest.Provide(\"tool.<name>\", <json descriptor>). The descriptor is {\"description\": \"...\", \"parameters\": <JSON Schema object>} — the key is \"parameters\", not \"inputSchema\". Re-defining a name replaces the existing tool.",
 				Parameters: json.RawMessage(`{"type":"object","properties":{
   "name": {"type":"string","description":"tool name; a single path segment, no separators"},
   "source": {"type":"string","description":"complete Go source of the guest tool"}
