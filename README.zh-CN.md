@@ -6,8 +6,8 @@
 [stc-go](https://github.com/0xdenny218/stc-go)（时空可组合性范式的 Go 实现）。
 
 > 状态：**v0.1.1 已发布**——`--tools-dir` 里的每个 `*.wasm` 都是 guest
-> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M7 完成（M7：
-> hooks + prompt 段落 + 自描述）；harness 化路线 M8–M10 见下。
+> 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M8 完成（M8：
+> skills + MCP stdio 工具 fiber）；harness 化路线 M9–M10 见下。
 
 ## 安装
 
@@ -37,6 +37,8 @@ go run ./cmd/stc-agent -p "explain this repo"   # 一次性：打印答复后退
 | `--transcript PATH` | — | JSONL 事件日志（消息 + token 用量）；文件已存在则 replay 恢复 |
 | `--resume PATH` | — | `--transcript` 的别名 |
 | `--tools-dir DIR` | — | `tools.d`；其中每个 `*.wasm` 是一个 guest 工具 |
+| `--skills-dir DIR` | — | `skills.d`；其中每个 `<name>/SKILL.md` 热装载为一个 skill fiber |
+| `--mcp SPEC` | — | MCP stdio server，形如 `name=command args...`（可重复） |
 | `--config PATH` | — | `~/.config/stc-agent/config.json`（存在才读） |
 | `-p, --print TEXT` | — | 非交互跑单轮：打印答复，exit 0 |
 | `--allow LIST` | — | 逗号分隔的免审批工具名（`*` = 全部）；追加进策略 |
@@ -167,6 +169,31 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 的 guest 保留旧版本继续服役。描述只在初次装载时读取——换血换的是
 行为，不是已注册的名字/描述。
 
+## Skills（目录即热装载 fiber）
+
+`--skills-dir`（默认 `skills.d`）下每个含 `SKILL.md` 的子目录是一个
+skill——也是一个 fiber。文件由可选 frontmatter（`name` /
+`description`）加正文组成：正文注册为 system-prompt 段落
+（`skill:<name>`，与其余段落按名排序拼接），目录里的每个 `*.wasm`
+经与 `--tools-dir` 完全相同的机制（含 hmr）装成该 skill 自己的 guest
+工具。supervisor fiber 监听目录：**落盘一个 skill，它的 prompt 段落与
+工具下一轮就生效；删掉它，段落与工具即时撤销——对话进行中，不重启。**
+原地编辑 `SKILL.md` 热更新段落（registry 的同名覆盖语义）。启动期的
+坏 skill 让启动失败；运行期落盘的坏 skill 只上报
+（`[skill] <name>: <err>`），不波及其余。
+
+## MCP servers（stdio）
+
+`--mcp "name=command args..."`（可重复，或配置文件里的 `"mcp"` 键）
+把每个 MCP stdio server 装成独立 fiber：握手、`tools/list`，然后每个
+工具以 `mcp__<server>__<tool>` 注册进 toolset（描述前缀
+`[mcp:<server>]`）——agent 循环、审批门、hooks、`/tools` 对它们一视
+同仁。**断开 = 工具失效**：server 进程退出时其工具立即注销
+（`[mcp] <name> disconnected; N tools removed`），下一个请求的工具表
+里自然不再有它们。最小示例 server 在
+[`examples/mcp/echo`](examples/mcp/echo)。仅 stdio——MCP over
+HTTP/SSE 是不做项。
+
 ## 是什么
 
 - CLI 对话 agent（stdin/stdout），带流式工具调用循环。
@@ -182,13 +209,15 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 
 ## 不做
 
-- 不做 UI/TUI/web；不做 provider 抽象层；不做 sandbox 隔离执行。
+- 不做 UI/TUI/web；不做 provider 抽象层；不做 sandbox 隔离执行；不做
+  MCP over HTTP/SSE；不做 skill 市场/分发。
 - 自身不做框架：不做插件分发、profile 组合与二次开发平台。stc-agent
   之于 [stc-go](https://github.com/0xdenny218/stc-go) 正如 dsh 之于
   Cordis——把框架用透到全部要求的那个 agent，框架能力只经回流在上游
   生长。**agent 能力面**以
   [dsh](https://github.com/deepseek-ai/deepseek-harness) 为参照：
-  hooks、skills、MCP、subagent、compaction 在路线图上（M8–M9）。
+  hooks、skills、MCP 已完成（M7–M8）；subagent、compaction 在路线图
+  上（M9）。
 
 ## 里程碑
 
@@ -200,7 +229,8 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 - [x] M5 会话脊柱（事件日志）+ 流式 + 终端交互（readline、`-p` headless）
 - [x] M6 工具管线 + 审批门（策略 + 途中提问回路，决定落事件日志）
 - [x] M7 hooks（通知 + 拦截）+ system-prompt 段落 + `inspect_agent` 自描述
-- [ ] M8 skills + MCP
+- [x] M8 skills（SKILL.md 目录热装载为 fiber：prompt 段落 + guest 工具）
+  + MCP stdio server 工具 fiber（断开 = 工具失效）
 - [ ] M9 subagent + compaction + todos/plan/jobs
 - [ ] M10 工具包 + agent 自创作 guest 工具（评估）
 

@@ -8,8 +8,8 @@ spatiotemporal composability paradigm.
 
 > Status: **v0.1.1 released** — every `*.wasm` in `--tools-dir` is a guest
 > tool fiber, hot-swapped in place when you rebuild it, mid-conversation.
-> Milestones M0–M7 done (M7: hooks + prompt segments + self-inspection);
-> the harness roadmap (M8–M10) is below.
+> Milestones M0–M8 done (M8: skills + MCP stdio tool fibers);
+> the harness roadmap (M9–M10) is below.
 
 ## Install
 
@@ -39,6 +39,8 @@ Config precedence: built-in defaults < config file < environment < flags.
 | `--transcript PATH` | — | JSONL event log (messages + token usage); an existing file is replayed |
 | `--resume PATH` | — | alias of `--transcript` |
 | `--tools-dir DIR` | — | `tools.d`; every `*.wasm` in it is a guest tool |
+| `--skills-dir DIR` | — | `skills.d`; every `<name>/SKILL.md` hot-loads as a skill fiber |
+| `--mcp SPEC` | — | MCP stdio server as `name=command args...` (repeatable) |
 | `--config PATH` | — | `~/.config/stc-agent/config.json` if present |
 | `-p, --print TEXT` | — | run a single turn non-interactively, print the answer, exit 0 |
 | `--allow LIST` | — | comma-separated tool names to auto-approve (`*` = all); appended to the policy |
@@ -184,6 +186,33 @@ the boot (fiber dump, exit 1); a guest that fails to *reload* keeps the old
 version serving. The descriptor is read once at load — a swap changes
 behavior, not the registered name/description.
 
+## Skills (hot-loaded directories)
+
+Every subdirectory of `--skills-dir` (default `skills.d`) containing a
+`SKILL.md` is a skill — and a fiber. The file is an optional frontmatter
+(`name` / `description`) plus a body; the body registers as a system-prompt
+segment (`skill:<name>`, name-sorted with the rest), and any `*.wasm` in
+the directory loads as the skill's own guest tools via the same machinery
+as `--tools-dir` (hmr included). A supervisor fiber watches the directory:
+**drop a skill in and its prompt segment and tools are live for the next
+turn — delete it and they retract, mid-conversation, no restart.** Editing
+`SKILL.md` in place hot-updates the segment (the registry's same-name
+overwrite). A bad skill at boot fails the boot; a bad skill dropped later
+is reported (`[skill] <name>: <err>`) without disturbing the rest.
+
+## MCP servers (stdio)
+
+`--mcp "name=command args..."` (repeatable, or the `"mcp"` key in the
+config file) spawns each MCP stdio server as its own fiber: handshake,
+`tools/list`, and every tool registers into the toolset as
+`mcp__<server>__<tool>` (description prefixed `[mcp:<server>]`), so the
+agent loop, approval gate, hooks and `/tools` all treat them like any
+other tool. **Disconnect = tools vanish**: when a server process exits,
+its tools unregister immediately (`[mcp] <name> disconnected; N tools
+removed`) and the next request simply doesn't advertise them. A minimal
+example server lives in [`examples/mcp/echo`](examples/mcp/echo). Stdio
+only — MCP over HTTP/SSE is a non-goal.
+
 ## What it is
 
 - A CLI chat agent (stdin/stdout) with a streaming tool-calling loop.
@@ -200,15 +229,16 @@ behavior, not the registered name/description.
 
 ## Non-goals
 
-- No UI/TUI/web, no provider abstraction layer, no sandboxed execution.
+- No UI/TUI/web, no provider abstraction layer, no sandboxed execution, no
+  MCP over HTTP/SSE, no skill marketplace/distribution.
 - No framework ambitions of its own: no plugin distribution, no profile
   composition, no second-development platform. stc-agent is to
   [stc-go](https://github.com/0xdenny218/stc-go) what dsh is to Cordis —
   the agent that exercises the framework to its full requirements, so that
   framework capabilities grow upstream via reflux. Its **agent** capability
   set takes [dsh](https://github.com/deepseek-ai/deepseek-harness) as the
-  reference: hooks, skills, MCP, subagents and compaction are on
-  the roadmap (M8–M9).
+  reference: hooks, skills and MCP are done (M7–M8); subagents and
+  compaction are on the roadmap (M9).
 
 ## Milestones
 
@@ -223,7 +253,9 @@ behavior, not the registered name/description.
   decisions logged as events)
 - [x] M7 hooks (notify + intercept) + system-prompt segments +
   `inspect_agent` self-description
-- [ ] M8 skills + MCP
+- [x] M8 skills (SKILL.md directories hot-load as fibers: prompt segment +
+  guest tools) + MCP stdio servers as tool fibers (disconnect = tools
+  vanish)
 - [ ] M9 subagents + compaction + todos/plan/jobs
 - [ ] M10 tool pack + agent-authored guest tools (evaluation)
 

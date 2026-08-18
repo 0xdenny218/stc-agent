@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -646,5 +647,144 @@ func TestE2EApprovalGate(t *testing.T) {
 	}
 	if readResult != "approval-e2e" {
 		t.Fatalf("read_file should pass without asking: %q", readResult)
+	}
+}
+
+// E2E/SkillHotLoad（spec M8 验收）：对话进行中落盘一个 skill（SKILL.md），
+// 其 prompt 段落即时拼进 system prompt（不重启）；删除 skill 目录后段落
+// 消失。三轮对话：装前无段落 → 装后有段落（identity 段在前）→ 卸后无段落。
+func TestE2ESkillHotLoad(t *testing.T) {
+	skillsDir := t.TempDir()
+
+	mock := testutil.NewMockChat(func(n int, _ testutil.RecordedRequest) model.Message {
+		return model.Message{Role: "assistant", Content: fmt.Sprintf("turn-%d", n)}
+	})
+	defer mock.Close()
+
+	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
+	write, waitFor, waitExit := serveIn(t, []string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "m",
+		"--transcript", transcript,
+		"--skills-dir", skillsDir,
+	})
+
+	write("hi\n")
+	waitFor("turn-1")
+
+	// 对话进行中落盘 skill → 段落即时注册（loaded 消息在 Ready 之后打印，
+	// 看到它即段落已在注册表）。
+	skillDir := filepath.Join(skillsDir, "greeter")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"),
+		[]byte("---\ndescription: greet politely\n---\nBe friendly."), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("[skill] greeter loaded")
+
+	write("hi again\n")
+	waitFor("turn-2")
+
+	// 删除 skill 目录 → 段落即时注销。
+	if err := os.RemoveAll(skillDir); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("[skill] greeter unloaded")
+
+	write("third\n")
+	waitFor("turn-3")
+	write("/quit\n")
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+
+	reqs := mock.Requests()
+	if len(reqs) != 3 {
+		t.Fatalf("requests: %d", len(reqs))
+	}
+	if strings.Contains(reqs[0].System, "Be friendly.") {
+		t.Fatalf("turn 1 system must not contain the skill segment: %q", reqs[0].System)
+	}
+	idIdx := strings.Index(reqs[1].System, "You are stc-agent")
+	skIdx := strings.Index(reqs[1].System, "Be friendly.")
+	if idIdx < 0 || skIdx < 0 || idIdx > skIdx {
+		t.Fatalf("turn 2 system = identity + skill segment in name order: %q", reqs[1].System)
+	}
+	if strings.Contains(reqs[2].System, "Be friendly.") {
+		t.Fatalf("turn 3 system must drop the unloaded skill segment: %q", reqs[2].System)
+	}
+}
+
+// E2E/MCPToolCall（spec M8 验收）：MCP stdio server 的工具经 agent 循环
+// 被调用（模型点名 mcp__echo__echo，结果回灌）；server 断开后工具从
+// toolset 消失（下一轮请求的 ToolNames 里不再有它）。echo server 配
+// ECHO_DIE_AFTER_CALLS=1：答完第一次 tools/call 即退出（确定性断开）。
+func TestE2EMCPToolCall(t *testing.T) {
+	echoBin := filepath.Join(t.TempDir(), "echo-server")
+	if b, err := exec.Command("go", "build", "-o", echoBin, "../../examples/mcp/echo").CombinedOutput(); err != nil {
+		t.Fatalf("build echo server: %v\n%s", err, b)
+	}
+	// MCP 子进程继承 agent 的环境变量；echo 答完 1 次 tools/call 即退出。
+	t.Setenv("ECHO_DIE_AFTER_CALLS", "1")
+
+	mock := testutil.NewMockChat(func(n int, _ testutil.RecordedRequest) model.Message {
+		switch n {
+		case 1:
+			return model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
+				ID: "call_e", Type: "function",
+				Function: model.ToolCallFunction{Name: "mcp__echo__echo", Arguments: `{"text":"ping"}`},
+			}}}
+		case 2:
+			return model.Message{Role: "assistant", Content: "mcp answered"}
+		default:
+			return model.Message{Role: "assistant", Content: "after disconnect"}
+		}
+	})
+	defer mock.Close()
+
+	transcript := filepath.Join(t.TempDir(), "chat.jsonl")
+	write, waitFor, waitExit := serveIn(t, []string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "m",
+		"--transcript", transcript,
+		"--mcp", "echo=" + echoBin,
+		"--allow", "mcp__echo__echo", // M6 起 MCP 工具默认要审批；本测试与审批策略无关
+	})
+
+	write("use mcp\n")
+	waitFor("mcp answered")
+
+	// echo 答完即退出 → 断开协程注销工具并上报（状态消息在注销之后打印）。
+	waitFor("[mcp] echo disconnected")
+
+	write("again\n")
+	waitFor("after disconnect")
+	write("/quit\n")
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+
+	reqs := mock.Requests()
+	if len(reqs) != 3 {
+		t.Fatalf("requests: %d", len(reqs))
+	}
+	if !strings.Contains(strings.Join(reqs[0].ToolNames, ","), "mcp__echo__echo") {
+		t.Fatalf("mcp tool not advertised: %v", reqs[0].ToolNames)
+	}
+	var toolResult string
+	for _, m := range reqs[1].Messages {
+		if m.Role == "tool" && m.ToolCallID == "call_e" {
+			toolResult = m.Content
+		}
+	}
+	if !strings.Contains(toolResult, "ping") {
+		t.Fatalf("mcp tool result should echo back: %q", toolResult)
+	}
+	if strings.Contains(strings.Join(reqs[2].ToolNames, ","), "mcp__echo__echo") {
+		t.Fatalf("tool must vanish after server disconnect: %v", reqs[2].ToolNames)
 	}
 }

@@ -59,61 +59,70 @@ func GuestToolComponent(path string, onReload func(name string, err error)) stc.
 		Name:   "guest-tool:" + name,
 		Inject: []stc.Key{KeyRuntime, tools.KeyTools},
 		Apply: func(c *stc.Context) (stc.Inverse, error) {
-			rt, err := stc.Service[*wasm.Runtime](c, KeyRuntime)
-			if err != nil {
-				return nil, err
-			}
-			ts, err := stc.Service[*tools.Toolset](c, tools.KeyTools)
-			if err != nil {
-				return nil, err
-			}
-			src, err := os.ReadFile(path)
-			if err != nil {
-				return nil, fmt.Errorf("guest tool %s: %w", name, err)
-			}
-			h, err := wasm.Load(stdctx.Background(), c, rt, src, wasm.Options{Name: name})
-			if err != nil {
-				return nil, fmt.Errorf("guest tool %s: %w", name, err)
-			}
-			// guest 的 start 已在 Ready 前跑完；描述服务缺席即坏 guest，
-			// 装载失败（启动期 fail-fast，见 spec M3）。
-			raw, err := stc.Service[string](c, rt.Key("tool."+name))
-			if err != nil {
-				h.Dispose()
-				return nil, fmt.Errorf("guest tool %s: no tool.%s service provided: %w", name, name, err)
-			}
-			var d descriptor
-			if err := json.Unmarshal([]byte(raw), &d); err != nil {
-				h.Dispose()
-				return nil, fmt.Errorf("guest tool %s: bad descriptor: %w", name, err)
-			}
-			unregister := ts.Register(name, tools.Tool{
-				Name:        name,
-				Description: d.Description,
-				Parameters:  d.Parameters,
-				Invoke: func(ctx stdctx.Context, args json.RawMessage) (string, error) {
-					return h.Call(ctx, "invoke", string(args))
-				},
-			})
-			report := func(err error) {
-				if onReload != nil {
-					onReload(name, err)
-				}
-			}
-			w, err := hmr.Watch(stdctx.Background(), h, path, &hmr.Options{OnReload: report})
-			if err != nil {
-				_ = unregister()
-				h.Dispose()
-				return nil, fmt.Errorf("guest tool %s: watch: %w", name, err)
-			}
-			return func() error {
-				werr := w.Close()
-				uerr := unregister()
-				h.Dispose()
-				return errors.Join(werr, uerr)
-			}, nil
+			return Load(c, path, onReload)
 		},
 	}
+}
+
+// Load 是 GuestToolComponent 的函数形态：在调用方 fiber 的 Apply 内把
+// path 指向的 .wasm 装成工具（注册进 toolset + hmr 监听），返回的逆
+// 随调用方 fiber 回卷执行（撤销注册、停止监听、撤退句柄）。skill
+// fiber 用它把目录里的 *.wasm 装成自己的工具子集（spec M8）。
+func Load(c *stc.Context, path string, onReload func(name string, err error)) (stc.Inverse, error) {
+	name := strings.TrimSuffix(filepath.Base(path), ".wasm")
+	rt, err := stc.Service[*wasm.Runtime](c, KeyRuntime)
+	if err != nil {
+		return nil, err
+	}
+	ts, err := stc.Service[*tools.Toolset](c, tools.KeyTools)
+	if err != nil {
+		return nil, err
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("guest tool %s: %w", name, err)
+	}
+	h, err := wasm.Load(stdctx.Background(), c, rt, src, wasm.Options{Name: name})
+	if err != nil {
+		return nil, fmt.Errorf("guest tool %s: %w", name, err)
+	}
+	// guest 的 start 已在 Ready 前跑完；描述服务缺席即坏 guest，
+	// 装载失败（启动期 fail-fast，见 spec M3）。
+	raw, err := stc.Service[string](c, rt.Key("tool."+name))
+	if err != nil {
+		h.Dispose()
+		return nil, fmt.Errorf("guest tool %s: no tool.%s service provided: %w", name, name, err)
+	}
+	var d descriptor
+	if err := json.Unmarshal([]byte(raw), &d); err != nil {
+		h.Dispose()
+		return nil, fmt.Errorf("guest tool %s: bad descriptor: %w", name, err)
+	}
+	unregister := ts.Register(name, tools.Tool{
+		Name:        name,
+		Description: d.Description,
+		Parameters:  d.Parameters,
+		Invoke: func(ctx stdctx.Context, args json.RawMessage) (string, error) {
+			return h.Call(ctx, "invoke", string(args))
+		},
+	})
+	report := func(err error) {
+		if onReload != nil {
+			onReload(name, err)
+		}
+	}
+	w, err := hmr.Watch(stdctx.Background(), h, path, &hmr.Options{OnReload: report})
+	if err != nil {
+		_ = unregister()
+		h.Dispose()
+		return nil, fmt.Errorf("guest tool %s: watch: %w", name, err)
+	}
+	return func() error {
+		werr := w.Close()
+		uerr := unregister()
+		h.Dispose()
+		return errors.Join(werr, uerr)
+	}, nil
 }
 
 // Components 扫描 dir 下全部 *.wasm，每个文件一个 GuestToolComponent。

@@ -8,6 +8,8 @@
 // passes an approval gate (policy + mid-turn question loop) before running.
 // M7: hooks (notify + intercept), system prompt assembled from fiber-registered
 // segments, and an inspect_agent tool for self-description.
+// M8: skills (SKILL.md directories hot-loaded as fibers) and MCP stdio
+// servers as tool fibers (disconnect = tools vanish).
 package main
 
 import (
@@ -29,9 +31,11 @@ import (
 	"github.com/0xdenny218/stc-agent/internal/inspect"
 	"github.com/0xdenny218/stc-agent/internal/interaction"
 	"github.com/0xdenny218/stc-agent/internal/loop"
+	"github.com/0xdenny218/stc-agent/internal/mcp"
 	"github.com/0xdenny218/stc-agent/internal/model"
 	"github.com/0xdenny218/stc-agent/internal/prompt"
 	"github.com/0xdenny218/stc-agent/internal/session"
+	"github.com/0xdenny218/stc-agent/internal/skills"
 	"github.com/0xdenny218/stc-agent/internal/tools"
 	stc "github.com/0xdenny218/stc-go"
 )
@@ -45,6 +49,8 @@ type options struct {
 	policy     approval.Policy
 	transcript string
 	toolsDir   string
+	skillsDir  string
+	mcpServers []mcp.Server
 	print      string
 }
 
@@ -68,16 +74,21 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 		transcript = fs.String("transcript", "", "append a JSONL transcript to this path; an existing file is replayed")
 		resume     = fs.String("resume", "", "alias of --transcript: resume from this transcript file")
 		toolsDir   = fs.String("tools-dir", "tools.d", "directory of *.wasm guest tools (watched for hot-swap)")
+		skillsDir  = fs.String("skills-dir", "skills.d", "directory of skills (each <name>/SKILL.md hot-loads as a fiber)")
 		printShort = fs.String("p", "", "print mode: run a single turn non-interactively and exit")
 		printLong  = fs.String("print", "", "alias of -p")
 		allow      = fs.String("allow", "", "comma-separated tool names to auto-approve (\"*\" allows all)")
+		mcpSpecs   []string
 	)
+	fs.Var(funcValue(func(v string) error { mcpSpecs = append(mcpSpecs, v); return nil }),
+		"mcp", "MCP stdio server as name=command args... (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
 	}
 
 	cfg := defaultConfig()
 	policy := approval.DefaultPolicy()
+	var servers []mcp.Server
 
 	path := *configPath
 	if path == "" {
@@ -89,13 +100,14 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 		}
 	}
 	if path != "" {
-		filePolicy, err := mergeFile(&cfg, path)
+		filePolicy, fileServers, err := mergeFile(&cfg, path)
 		if err != nil {
 			return options{}, err
 		}
 		if filePolicy != nil {
 			policy = *filePolicy
 		}
+		servers = append(servers, fileServers...)
 	}
 
 	if v := firstNonEmpty(getenv("STC_AGENT_API_KEY"), getenv("DEEPSEEK_API_KEY"), getenv("OPENAI_API_KEY")); v != "" {
@@ -123,6 +135,13 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if *allow != "" {
 		policy.Allow = append(policy.Allow, strings.Split(*allow, ",")...)
 	}
+	for _, spec := range mcpSpecs {
+		srv, err := parseMCPSpec(spec)
+		if err != nil {
+			return options{}, err
+		}
+		servers = append(servers, srv)
+	}
 
 	tp := *transcript
 	if *resume != "" {
@@ -132,7 +151,26 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if *printLong != "" {
 		pp = *printLong
 	}
-	return options{cfg: cfg, policy: policy, transcript: tp, toolsDir: *toolsDir, print: pp}, nil
+	return options{cfg: cfg, policy: policy, transcript: tp, toolsDir: *toolsDir, skillsDir: *skillsDir, mcpServers: servers, print: pp}, nil
+}
+
+// funcValue 把单值回调适配成 flag.Value（--mcp 这类可重复旗标）。
+type funcValue func(string) error
+
+func (f funcValue) String() string     { return "" }
+func (f funcValue) Set(v string) error { return f(v) }
+
+// parseMCPSpec 解析 --mcp 的 "name=command args..." 形式。
+func parseMCPSpec(v string) (mcp.Server, error) {
+	name, cmdline, ok := strings.Cut(v, "=")
+	if !ok || strings.TrimSpace(name) == "" {
+		return mcp.Server{}, fmt.Errorf("--mcp: want name=command args..., got %q", v)
+	}
+	fields := strings.Fields(cmdline)
+	if len(fields) == 0 {
+		return mcp.Server{}, fmt.Errorf("--mcp %s: empty command", name)
+	}
+	return mcp.Server{Name: name, Command: fields[0], Args: fields[1:]}, nil
 }
 
 // fileConfig 是配置文件的子集（timeout 只走命令行）。
@@ -141,19 +179,20 @@ type fileConfig struct {
 	APIKey   string           `json:"api_key"`
 	Model    string           `json:"model"`
 	Approval *approval.Policy `json:"approval"`
+	MCP      []mcp.Server     `json:"mcp"`
 }
 
 // mergeFile 把配置文件并入 cfg，返回文件携带的审批策略（无则 nil——
 // 策略不经 config.Config：它是启动期输入，与 transcript/toolsDir 同族，
-// 不随 /model 级联热换）。
-func mergeFile(cfg *config.Config, path string) (*approval.Policy, error) {
+// 不随 /model 级联热换）与 MCP server 列表。
+func mergeFile(cfg *config.Config, path string) (*approval.Policy, []mcp.Server, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read config file: %w", err)
+		return nil, nil, fmt.Errorf("read config file: %w", err)
 	}
 	var fc fileConfig
 	if err := json.Unmarshal(b, &fc); err != nil {
-		return nil, fmt.Errorf("parse config file %s: %w", path, err)
+		return nil, nil, fmt.Errorf("parse config file %s: %w", path, err)
 	}
 	if fc.BaseURL != "" {
 		cfg.BaseURL = fc.BaseURL
@@ -164,7 +203,12 @@ func mergeFile(cfg *config.Config, path string) (*approval.Policy, error) {
 	if fc.Model != "" {
 		cfg.Model = fc.Model
 	}
-	return fc.Approval, nil
+	for i, srv := range fc.MCP {
+		if srv.Name == "" || srv.Command == "" {
+			return nil, nil, fmt.Errorf("config file %s: mcp[%d] needs name and command", path, i)
+		}
+	}
+	return fc.Approval, fc.MCP, nil
 }
 
 func firstNonEmpty(vs ...string) string {
@@ -263,6 +307,24 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		return 2
 	}
 	comps = append(comps, guestComps...)
+	// skills（spec M8）：supervisor 监听 skills-dir，落盘即装、删除即卸。
+	comps = append(comps, skills.SupervisorComponent(root, opts.skillsDir, dir.Register,
+		func(name string, err error) {
+			fmt.Fprintf(stdout, "[skill] %s: %v\n", name, err)
+		},
+		func(name string, loaded bool) {
+			if loaded {
+				fmt.Fprintf(stdout, "[skill] %s loaded\n", name)
+			} else {
+				fmt.Fprintf(stdout, "[skill] %s unloaded\n", name)
+			}
+		}))
+	// MCP stdio servers（spec M8）：每个 server 一个 fiber，断开 = 工具失效。
+	for _, srv := range opts.mcpServers {
+		comps = append(comps, mcp.Component(srv, func(s string) {
+			fmt.Fprintln(stdout, s)
+		}))
+	}
 	comps = append(comps,
 		loop.Component(10),
 		cli.ModelCommandComponent(),
