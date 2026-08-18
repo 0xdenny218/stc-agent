@@ -7,7 +7,7 @@
 
 > 状态：**v0.1.0 已发布**——`--tools-dir` 里的每个 `*.wasm` 都是 guest
 > 工具 fiber，原地重建即在对话进行中热替换。里程碑 M0–M4 完成；
-> harness 化路线 M5–M9 见下。
+> harness 化路线 M5–M10 见下。
 
 ## 安装
 
@@ -157,11 +157,12 @@ tinygo build ... -tags v2 -o tools.d/dice.wasm ./examples/guests/dice
 - [x] M2 工具系统 + agent 循环（toolset 稳定服务、静态 Go 工具）
 - [x] M3 WASM guest 工具 + 热重载（hmr）：对话中途换工具
 - [x] M4 发布 + 回流评审（v0.1.0 已上 GitHub；评审产出为 stc-go issues）
-- [ ] M5 会话脊柱（事件日志 + 投影）+ 流式
+- [ ] M5 会话脊柱（事件日志）+ 流式 + 终端交互（readline、`-p` headless）
 - [ ] M6 工具管线 + 审批门
-- [ ] M7 hooks + system-prompt 组装
+- [ ] M7 hooks + system-prompt 组装 + agent 自描述
 - [ ] M8 skills + MCP
-- [ ] M9 subagent + compaction
+- [ ] M9 subagent + compaction + todos/plan/jobs
+- [ ] M10 工具包 + agent 自创作 guest 工具（评估）
 
 ## 开发
 

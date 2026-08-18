@@ -8,7 +8,7 @@ spatiotemporal composability paradigm.
 
 > Status: **v0.1.0 released** — every `*.wasm` in `--tools-dir` is a guest
 > tool fiber, hot-swapped in place when you rebuild it, mid-conversation.
-> Milestones M0–M4 done; the harness roadmap (M5–M9) is below.
+> Milestones M0–M4 done; the harness roadmap (M5–M10) is below.
 
 ## Install
 
@@ -166,11 +166,13 @@ behavior, not the registered name/description.
 - [x] M2 tool system + agent loop (toolset as stable service, static Go tools)
 - [x] M3 WASM guest tools + hot reload (hmr): mid-conversation tool swap
 - [x] M4 release + satellite-package review (v0.1.0 on GitHub; the review is filed as stc-go issues)
-- [ ] M5 session spine (event log + projections) + streaming
+- [ ] M5 session spine (event log) + streaming + terminal interaction
+  (readline, `-p` headless)
 - [ ] M6 tool pipeline + approval gate
-- [ ] M7 hooks + system-prompt assembly
+- [ ] M7 hooks + system-prompt assembly + agent self-inspection
 - [ ] M8 skills + MCP
-- [ ] M9 subagents + compaction
+- [ ] M9 subagents + compaction + todos/plan/jobs
+- [ ] M10 tool pack + agent-authored guest tools (evaluation)
 
 ## Development
 
