@@ -50,6 +50,7 @@ go run ./cmd/stc-agent -p "explain this repo"   # 一次性：打印答复后退
 | `--resume PATH` | — | `--transcript` 的别名 |
 | `--tools-dir DIR` | — | `tools.d`；其中每个 `*.wasm` 是一个 guest 工具 |
 | `--skills-dir DIR` | — | `skills.d`；其中每个 `<name>/SKILL.md` 热装载为一个 skill fiber |
+| `--commands-dir DIR` | — | `commands.d`；每个 `<name>.md` 热装载为一个自定义斜杠命令（正文里的 `$ARGUMENTS` 接收参数） |
 | `--spill-dir DIR` | — | `spill`；`spill` 工具写草稿文件的目录 |
 | `--authored-dir DIR` | — | `<tools-dir>/authored`；模型自创作 guest 的源码与产物 |
 | `--tinygo PATH` | — | `tinygo`（取自 PATH）；`define_guest` 用的编译器 |
@@ -58,7 +59,11 @@ go run ./cmd/stc-agent -p "explain this repo"   # 一次性：打印答复后退
 | `-p, --print TEXT` | — | 非交互跑单轮：打印答复，exit 0 |
 | `--allow LIST` | — | 逗号分隔的免审批工具名（`*` = 全部）；追加进策略 |
 | `--compact-threshold N` | — | `100000`；一轮 prompt tokens 超过 N 即压缩历史（0 关闭） |
+| `--sessions` | — | 列出历史会话（标题 + 路径，最新在前）后退出 |
+| `--show-thinking` | — | 流式展示模型思考（`reasoning_content` 与内联 `<think>`）而非隐藏 |
+| `--bell` | — | 轮次结束响终端铃 |
 | — | `STC_AGENT_WEB_SEARCH_URL` | DuckDuckGo Instant Answer 模板（`{q}` = 查询）；可换任意搜索后端 |
+| — | `STC_AGENT_SESSIONS_DIR` | `~/.config/stc-agent/sessions`；REPL 自动持久化会话的目录 |
 
 在终端里 REPL 有 readline 行编辑与历史（stdin 是管道时退回普通逐行
 读取）。模型答复逐块流式呈现。Ctrl-C 中断当前轮而不杀会话；在提示符
@@ -70,6 +75,8 @@ REPL 内命令：
 - `/model <name>`——对话中途换模型。config 服务被重提供，模型客户端与
   REPL 反应式重载，而 session fiber（不依赖这两者）逐字保留历史。
 - `/tools`——列出已注册工具。
+- `/resume`——列出历史会话（标题 + 路径）；用 `stc-agent --resume <path>`
+  （或 `--resume latest`）重启恢复。
 - `/plan`——切换 plan 模式（在计划经 `exit_plan_mode` 批准前阻断非只读
   工具）。
 - `/help`——列出命令。
@@ -108,12 +115,17 @@ REPL 内命令：
 名单；两边都不命中的工具走询问。询问会把轮次挂起在工具循环中途：
 
 ```
-! allow "shell" to run?
-  {"command": "echo hi"}
-  [y] allow once  [n] deny  [a] always allow shell
+! allow "write_file" to run?
+  --- conf.txt
+  +++ conf.txt
+  @@ -1,1 +1,1 @@
+  -old line
+  +new line
+  [y] allow once  [n] deny  [a] always allow write_file
 ```
 
-`y` 只放行这一次；`n` 把 `error: denied by user` 作为工具结果回灌给
+写类工具（`write_file`/`edit`/`spill`）在询问前展示待写入变更的统一
+diff——看着 diff 批准，而不是反推参数 JSON（M11）。`y` 只放行这一次；`n` 把 `error: denied by user` 作为工具结果回灌给
 模型（轮次继续）；`a` 在本会话内对该工具免审批。无法交互作答时
 （`-p` headless 模式）门禁 fail-closed：问不了就拒绝。每个经询问得出
 的决定——批准或拒绝——都以 `approval` 事件追加进 transcript，并记录
@@ -296,6 +308,40 @@ tool result: guest tool "shout" defined and loaded (source kept at tools.d/autho
 定义 → 调用 → 结果真实来自 wasm，外加回卷契约（编译失败无残项、源码
 保留可重试）。
 
+## 项目指令、会话、自定义命令、shell hooks（M11）
+
+主流 CLI agent 的公因数能力：
+
+- **AGENTS.md**——工作目录的 `AGENTS.md`（跨 agent 的事实标准约定）装载
+  为 system-prompt 段落；对话中编辑，下一个请求即看到新指令。
+- **会话管理**——REPL 把每个会话自动持久化进
+  `~/.config/stc-agent/sessions`（`STC_AGENT_SESSIONS_DIR` 可覆盖）；
+  `--sessions` 列出（标题取 `session_title` 工具写入、无则首条 user 消息
+  首行）、`/resume` 在 REPL 内列出、`--resume latest`（或给路径）重放
+  恢复。`-p` 一次性模式默认即抛，要留痕显式传 `--transcript`。
+- **自定义斜杠命令**——`--commands-dir`（默认 `commands.d`）里的每个
+  `*.md` 是一个 `/命令`：可选 frontmatter（`description`）加正文作为该轮
+  prompt，`$ARGUMENTS` 替换为参数（无占位符则追加）。对话中落盘即生效
+  ——skills 的 supervisor 模式套在命令注册表上。
+- **配置级 shell hooks**——不用写 Go：
+
+  ```json
+  {
+    "hooks": {
+      "agent/turn-start": "echo start >> ~/agent.log",
+      "agent/turn-end": "afplay /System/Library/Sounds/Glass.aiff",
+      "tools/pre-execute": "[ \"$STC_HOOK_TOOL\" = shell ] && case \"$STC_HOOK_ARGUMENTS\" in *rm\ -rf*) echo refused; exit 1;; esac"
+    }
+  }
+  ```
+
+  `tools/pre-execute` 是拦截位：退出码非 0 阻断该次工具调用，stderr 回灌
+  模型；其余是通知位。载荷经 `STC_HOOK_EVENT` / `STC_HOOK_TOOL` /
+  `STC_HOOK_ARGUMENTS` / `STC_HOOK_RESULT` / `STC_HOOK_TEXT` 注入。
+- **小件**——每轮结束一行用量（`[tokens: prompt N + completion M = T]`）、
+  `--bell` 轮次结束响铃、`--show-thinking` 流式展示模型思考
+  （`reasoning_content` 与内联 `<think>`）而非默认隐藏。
+
 ## 是什么
 
 - CLI 对话 agent（stdin/stdout），带流式工具调用循环。
@@ -339,6 +385,10 @@ tool result: guest tool "shout" defined and loaded (source kept at tools.d/autho
 - [x] M10 工具包（edit/glob/grep、spill、session_title）+ 网络工具
   （带 SSRF 门的 `web_fetch`/`web_search`）+ agent 自创作 guest
   （`define_guest`：模型写源码 → TinyGo 编译 → 装载；v0.2.0）
+- [x] M11 公因数能力——AGENTS.md 项目指令、审批门 diff 预览、会话管理
+  （自动持久化 / `--sessions` / `--resume latest`）、自定义斜杠命令
+  （`commands.d/*.md`）、用量显示、`--bell`、`--show-thinking`、配置级
+  shell hooks
 
 ## 开发
 

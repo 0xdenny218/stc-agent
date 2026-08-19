@@ -45,5 +45,21 @@ func SpillComponent(dir string) stc.Component {
 			}
 			return fmt.Sprintf("wrote %d bytes to %s", len(a.Content), p), nil
 		},
+		// 预览与 write_file 同族：目标文件存在则 diff，草稿新建则从空创建。
+		Preview: func(args json.RawMessage) string {
+			var a struct {
+				Name    string `json:"name"`
+				Content string `json:"content"`
+			}
+			if err := json.Unmarshal(args, &a); err != nil || a.Name == "" {
+				return ""
+			}
+			p := filepath.Join(dir, a.Name)
+			old, err := os.ReadFile(p)
+			if err != nil {
+				return unifiedDiff(p+" (new file)", "", a.Content)
+			}
+			return unifiedDiff(p, string(old), a.Content)
+		},
 	})
 }

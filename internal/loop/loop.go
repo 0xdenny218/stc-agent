@@ -168,6 +168,9 @@ func (r *runner) RunTurn(ctx stdctx.Context, input string, w io.Writer) (err err
 		}
 		if len(msg.ToolCalls) == 0 {
 			fmt.Fprintln(w) // 内容已流式打出，补收尾换行
+			// 用量随轮打印（spec M11 小件）：一行，轻量可见。
+			fmt.Fprintf(w, "[tokens: prompt %d + completion %d = %d]\n",
+				resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens)
 			final = msg.Content
 			r.maybeCompact(ctx, w)
 			return nil

@@ -53,6 +53,7 @@ Config precedence: built-in defaults < config file < environment < flags.
 | `--resume PATH` | — | alias of `--transcript` |
 | `--tools-dir DIR` | — | `tools.d`; every `*.wasm` in it is a guest tool |
 | `--skills-dir DIR` | — | `skills.d`; every `<name>/SKILL.md` hot-loads as a skill fiber |
+| `--commands-dir DIR` | — | `commands.d`; every `<name>.md` hot-loads as a custom slash command (`$ARGUMENTS` in the body receives the args) |
 | `--spill-dir DIR` | — | `spill`; where the `spill` tool writes scratch files |
 | `--authored-dir DIR` | — | `<tools-dir>/authored`; sources and builds of model-authored guest tools |
 | `--tinygo PATH` | — | `tinygo` (from PATH); the compiler `define_guest` uses |
@@ -61,7 +62,11 @@ Config precedence: built-in defaults < config file < environment < flags.
 | `-p, --print TEXT` | — | run a single turn non-interactively, print the answer, exit 0 |
 | `--allow LIST` | — | comma-separated tool names to auto-approve (`*` = all); appended to the policy |
 | `--compact-threshold N` | — | `100000`; compact history when a turn's prompt tokens exceed N (0 disables) |
+| `--sessions` | — | list past sessions (title + path, newest first) and exit |
+| `--show-thinking` | — | stream model reasoning (`reasoning_content` and inline `<think>`) instead of hiding it |
+| `--bell` | — | ring the terminal bell when a turn ends |
 | — | `STC_AGENT_WEB_SEARCH_URL` | DuckDuckGo Instant Answer template (`{q}` = query); swap in any search backend |
+| — | `STC_AGENT_SESSIONS_DIR` | `~/.config/stc-agent/sessions`; where the REPL auto-persists sessions |
 
 On a terminal the REPL has readline line editing with history (plain line
 reads when stdin is piped). Model answers stream in as they arrive.
@@ -75,6 +80,8 @@ Commands inside the REPL:
   config service; the model client and REPL reload reactively, while the
   session fiber (which depends on neither) keeps the history verbatim.
 - `/tools` — list registered tools.
+- `/resume` — list past sessions (title + path); restart with
+  `stc-agent --resume <path>` (or `--resume latest`) to pick one up.
 - `/plan` — toggle plan mode (block non-read-only tools until the plan is
   approved via `exit_plan_mode`).
 - `/help` — list commands.
@@ -118,12 +125,18 @@ allow list; a tool matched by neither asks. A question suspends the turn
 mid-loop:
 
 ```
-! allow "shell" to run?
-  {"command": "echo hi"}
-  [y] allow once  [n] deny  [a] always allow shell
+! allow "write_file" to run?
+  --- conf.txt
+  +++ conf.txt
+  @@ -1,1 +1,1 @@
+  -old line
+  +new line
+  [y] allow once  [n] deny  [a] always allow write_file
 ```
 
-`y` runs this one call; `n` feeds `error: denied by user` back to the model
+Writing tools (`write_file`/`edit`/`spill`) show a unified diff of the
+pending change in the question, so you approve by reading the diff, not by
+decoding the arguments JSON (M11). `y` runs this one call; `n` feeds `error: denied by user` back to the model
 as the tool result (the turn continues); `a` auto-approves the tool for the
 rest of the session. With no interactive answer possible (`-p` headless
 mode) the gate is fail-closed: having to ask means denying. Every decision
@@ -332,6 +345,45 @@ next request advertised `shout` like any built-in. The E2E
 scripted model: define → invoke → wasm-sourced result, plus the rollback
 contracts (compile failure leaves no residue, source kept for retry).
 
+## Project instructions, sessions, custom commands, shell hooks (M11)
+
+The common-denominator features every mainstream CLI agent has:
+
+- **AGENTS.md** — the working directory's `AGENTS.md` (the emerging
+  cross-agent convention) loads as a system-prompt segment; edit it
+  mid-conversation and the next request sees the new instructions.
+- **Sessions** — the REPL auto-persists every session into
+  `~/.config/stc-agent/sessions` (override with `STC_AGENT_SESSIONS_DIR`);
+  `--sessions` lists them (title from the `session_title` tool, else the
+  first user line), `/resume` lists in-REPL, and `--resume latest` (or a
+  path) replays one. `-p` one-shots stay ephemeral unless you pass
+  `--transcript`.
+- **Custom slash commands** — every `*.md` in `--commands-dir` (default
+  `commands.d`) is a `/command`: optional frontmatter (`description`) plus
+  a body that becomes the turn's prompt, with `$ARGUMENTS` substituted (or
+  the args appended). Drop a file in mid-conversation and it's live — the
+  same supervisor pattern as skills, on the command registry.
+- **Config-level shell hooks** — no Go required:
+
+  ```json
+  {
+    "hooks": {
+      "agent/turn-start": "echo start >> ~/agent.log",
+      "agent/turn-end": "afplay /System/Library/Sounds/Glass.aiff",
+      "tools/pre-execute": "[ \"$STC_HOOK_TOOL\" = shell ] && case \"$STC_HOOK_ARGUMENTS\" in *rm\\ -rf*) echo refused; exit 1;; esac"
+    }
+  }
+  ```
+
+  `tools/pre-execute` is an intercept: a non-zero exit blocks that tool
+  call and the command's stderr feeds back to the model; the others are
+  notifications. Payload arrives via `STC_HOOK_EVENT` / `STC_HOOK_TOOL` /
+  `STC_HOOK_ARGUMENTS` / `STC_HOOK_RESULT` / `STC_HOOK_TEXT`.
+- **Smalls** — a one-line token count after every turn
+  (`[tokens: prompt N + completion M = T]`), `--bell` for a terminal bell
+  when a turn ends, and `--show-thinking` to stream the model's reasoning
+  (`reasoning_content` and inline `<think>`) instead of hiding it.
+
 ## What it is
 
 - A CLI chat agent (stdin/stdout) with a streaming tool-calling loop.
@@ -382,6 +434,11 @@ contracts (compile failure leaves no residue, source kept for retry).
 - [x] M10 tool pack (edit/glob/grep, spill, session_title) + web tools
   (SSRF-guarded `web_fetch`/`web_search`) + agent-authored guest tools
   (`define_guest`: model-written source → TinyGo compile → load; v0.2.0)
+- [x] M11 common-denominator features — AGENTS.md instructions, diff
+  previews in the approval gate, session management (auto-persist /
+  `--sessions` / `--resume latest`), custom slash commands
+  (`commands.d/*.md`), token display, `--bell`, `--show-thinking`,
+  config-level shell hooks
 
 ## Development
 

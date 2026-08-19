@@ -17,10 +17,13 @@ import (
 // Config 是模型接入配置（热可换的部分）。会话等不愿被级联波及的能力
 // 不 inject 它——依赖图之外即存活（spec D4）。
 type Config struct {
-	BaseURL string        `json:"base_url"`
-	APIKey  string        `json:"api_key"`
-	Model   string        `json:"model"`
-	Timeout time.Duration `json:"-"`
+	BaseURL string `json:"base_url"`
+	APIKey  string `json:"api_key"`
+	Model   string `json:"model"`
+	// ShowThinking 展示模型思考：reasoning_content 增量与内联 <think>
+	// 段原样流出（默认净化隐藏）。
+	ShowThinking bool          `json:"show_thinking"`
+	Timeout      time.Duration `json:"-"`
 }
 
 func (c Config) Validate() error {

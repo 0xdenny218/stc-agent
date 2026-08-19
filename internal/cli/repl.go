@@ -227,7 +227,13 @@ func serve(ctx stdctx.Context, console *Console, r loop.Runner, reg *Registry, e
 				console.signalDone()
 				return
 			case strings.HasPrefix(line, "/"):
-				handled, err := Dispatch(ctx, w, line, reg)
+				// 用户命令（customcmd）可能整轮跑模型：与普通轮次同享
+				// Ctrl-C 语义（中断命令而非杀会话）。
+				turnCtx, cancel := stdctx.WithCancel(ctx)
+				console.setTurnCancel(cancel)
+				handled, err := Dispatch(turnCtx, w, line, reg)
+				console.setTurnCancel(nil)
+				cancel()
 				switch {
 				case !handled:
 					name, _, _ := strings.Cut(strings.TrimPrefix(line, "/"), " ")

@@ -28,6 +28,11 @@ type Tool struct {
 	Description string
 	Parameters  json.RawMessage // JSON Schema
 	Invoke      func(ctx stdctx.Context, args json.RawMessage) (string, error)
+	// Preview 可选：把参数渲染成人读的变更预览（统一 diff 等），供审批
+	// 门在询问前展示——用户按 diff 决定 y/n，而不是对着参数 JSON 猜。
+	// 返回空串 = 无预览（门回退到参数展示）。出错也应返回带说明的文本
+	// 而不是空串之外的特殊值。
+	Preview func(args json.RawMessage) string
 }
 
 // ToolsetComponent 提供稳定的工具注册表。

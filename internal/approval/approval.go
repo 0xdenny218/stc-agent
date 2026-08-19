@@ -6,6 +6,7 @@ package approval
 
 import (
 	stdctx "context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"github.com/0xdenny218/stc-agent/internal/interaction"
 	"github.com/0xdenny218/stc-agent/internal/model"
 	"github.com/0xdenny218/stc-agent/internal/session"
+	"github.com/0xdenny218/stc-agent/internal/tools"
 	stc "github.com/0xdenny218/stc-go"
 )
 
@@ -66,6 +68,7 @@ type Approver struct {
 	policy Policy
 	ia     interaction.Service
 	sess   *session.Session
+	ts     *tools.Toolset // 可选：询问前查工具的 Preview 渲染 diff
 
 	mu     sync.Mutex
 	always map[string]bool // 用户在本次会话里 "always allow" 的工具
@@ -76,19 +79,30 @@ func New(policy Policy, ia interaction.Service, sess *session.Session) *Approver
 	return &Approver{policy: policy, ia: ia, sess: sess, always: map[string]bool{}}
 }
 
-// Component 是审批门 fiber。只 inject session——不碰 config，换模型的
-// 级联不重载它，会话内的 always-allow 集合随 fiber 存活。
+// WithToolset 挂上工具表（链式）：询问前优先用工具的 Preview 生成人读
+// 预览（写类工具的统一 diff），用户按 diff 而不是参数 JSON 决定 y/n。
+func (a *Approver) WithToolset(ts *tools.Toolset) *Approver {
+	a.ts = ts
+	return a
+}
+
+// Component 是审批门 fiber。inject session 与稳定的工具表——都不碰
+// config，换模型的级联不重载它，会话内的 always-allow 集合随 fiber 存活。
 func Component(policy Policy, ia interaction.Service) stc.Component {
 	return stc.Component{
 		Name:    "approval",
-		Inject:  []stc.Key{session.KeySession},
+		Inject:  []stc.Key{session.KeySession, tools.KeyTools},
 		Provide: []stc.Key{KeyApprover},
 		Apply: func(c *stc.Context) (stc.Inverse, error) {
 			sess, err := stc.Service[*session.Session](c, session.KeySession)
 			if err != nil {
 				return nil, err
 			}
-			_, err = c.Provide(KeyApprover, Gate(New(policy, ia, sess)))
+			ts, err := stc.Service[*tools.Toolset](c, tools.KeyTools)
+			if err != nil {
+				return nil, err
+			}
+			_, err = c.Provide(KeyApprover, Gate(New(policy, ia, sess).WithToolset(ts)))
 			return nil, err
 		},
 	}
@@ -108,7 +122,7 @@ func (a *Approver) Check(ctx stdctx.Context, tc model.ToolCall) error {
 	}
 	ans, err := a.ia.Ask(ctx, interaction.Question{
 		Title:   fmt.Sprintf("allow %q to run?", name),
-		Detail:  truncate(args, 240),
+		Detail:  a.detailFor(name, args),
 		Default: "n",
 		Options: []interaction.Option{
 			{Key: "y", Label: "allow once"},
@@ -131,6 +145,19 @@ func (a *Approver) Check(ctx stdctx.Context, tc model.ToolCall) error {
 	default:
 		return a.deny(name, args, "user", "denied by user")
 	}
+}
+
+// detailFor 是询问时展示的细节：有 Preview 的工具给 diff（放宽到 4000
+// 字符），其余回退参数 JSON（240 字符）。
+func (a *Approver) detailFor(name, args string) string {
+	if a.ts != nil {
+		if t, ok := a.ts.Lookup(name); ok && t.Preview != nil {
+			if p := t.Preview(json.RawMessage(args)); p != "" {
+				return truncate(p, 4000)
+			}
+		}
+	}
+	return truncate(args, 240)
 }
 
 func (a *Approver) alwaysAllowed(name string) bool {

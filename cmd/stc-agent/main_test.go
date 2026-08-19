@@ -187,14 +187,40 @@ func readTranscript(t *testing.T, path string) (msgs []model.Message, usages []m
 	return msgs, usages, approvals
 }
 
+// serveInEnv 是 serveIn 的带环境变量版（会话目录等 env 覆盖类测试用）。
+func serveInEnv(t *testing.T, env map[string]string, args []string) (write func(string), waitFor func(string), waitExit func() int) {
+	t.Helper()
+	return serveInRaw(t, func(k string) string { return env[k] }, args)
+}
+
 // serveIn 启动 agent（脚本化 stdin），返回喂输入、等输出、等退出的助手。
 func serveIn(t *testing.T, args []string) (write func(string), waitFor func(string), waitExit func() int) {
 	t.Helper()
+	return serveInRaw(t, func(string) string { return "" }, args)
+}
+
+// serveInRaw 是 serveIn 的底层（自定义 getenv）。会话目录默认注入测试临时
+// 目录——REPL 自动持久化不落真实 HOME；刻意不伪造 HOME：define_guest 的
+// tinygo 子进程需要真实的模块/构建缓存（假 HOME 会让 go list 走网络拉
+// 依赖，在离线环境下挂死）。
+func serveInRaw(t *testing.T, getenv func(string) string, args []string) (write func(string), waitFor func(string), waitExit func() int) {
+	t.Helper()
+	sdir := t.TempDir()
+	inner := getenv
+	getenv = func(k string) string {
+		if k == "STC_AGENT_SESSIONS_DIR" {
+			if v := inner(k); v != "" {
+				return v
+			}
+			return sdir
+		}
+		return inner(k)
+	}
 	inR, inW := io.Pipe()
 	t.Cleanup(func() { inW.Close() })
 	out := &syncBuffer{}
 	exit := make(chan int, 1)
-	go func() { exit <- run(args, inR, out, func(string) string { return "" }) }()
+	go func() { exit <- run(args, inR, out, getenv) }()
 
 	write = func(s string) {
 		t.Helper()
@@ -980,5 +1006,214 @@ func main() {}
 	}
 	if _, err := os.Stat(filepath.Join(authoredDir, "echo.wasm")); err != nil {
 		t.Fatalf("authored wasm missing: %v", err)
+	}
+}
+
+// E2E/AgentsMd（spec M11）：启动目录的 AGENTS.md 装为 system-prompt 段落，
+// 对话中编辑即时生效（下一请求的 system 换新）。
+func TestE2EAgentsMd(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("Project rule: answer in haiku."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mock := testutil.NewMockChat(func(n int, _ testutil.RecordedRequest) model.Message {
+		return model.Message{Role: "assistant", Content: fmt.Sprintf("turn-%d", n)}
+	})
+	defer mock.Close()
+
+	write, waitFor, waitExit := serveIn(t, []string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "m",
+	})
+	write("hi\n")
+	waitFor("turn-1")
+	if sys := mock.Requests()[0].System; !strings.Contains(sys, "Project rule: answer in haiku.") {
+		t.Fatalf("AGENTS.md must land in the system prompt: %q", sys)
+	}
+
+	// 对话中编辑：等目录监听防抖落地（200ms 窗口）再发轮。
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("Project rule: be terse."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(700 * time.Millisecond)
+	write("again\n")
+	waitFor("turn-2")
+	if sys := mock.Requests()[1].System; !strings.Contains(sys, "be terse") {
+		t.Fatalf("edited AGENTS.md must hot-update: %q", sys)
+	}
+	write("/quit\n")
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+}
+
+// E2E/DiffPreview（spec M11）：write_file 询问前展示统一 diff，用户按
+// diff 决定 y/n。
+func TestE2EDiffPreview(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "conf.txt")
+	if err := os.WriteFile(target, []byte("old line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mock := testutil.NewMockChat(func(n int, _ testutil.RecordedRequest) model.Message {
+		if n == 1 {
+			args, _ := json.Marshal(map[string]string{"path": target, "content": "new line\n"})
+			return model.Message{Role: "assistant", ToolCalls: []model.ToolCall{{
+				ID: "call_w", Type: "function",
+				Function: model.ToolCallFunction{Name: "write_file", Arguments: string(args)},
+			}}}
+		}
+		return model.Message{Role: "assistant", Content: "done"}
+	})
+	defer mock.Close()
+
+	write, waitFor, waitExit := serveIn(t, []string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "m",
+	})
+	write("rewrite the config\n")
+	waitFor(`allow "write_file" to run?`)
+	waitFor("-old line")
+	waitFor("+new line")
+	write("n\n") // 按 diff 拒绝
+	waitFor("done")
+	write("/quit\n")
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	// 拒绝的写入从未落盘。
+	if b, err := os.ReadFile(target); err != nil || string(b) != "old line\n" {
+		t.Fatalf("denied write must not touch the file: %q, %v", string(b), err)
+	}
+}
+
+// E2E/CustomCommand（spec M11）：对话中落盘 commands.d/greet.md，下一刻
+// /greet 可用——$ARGUMENTS 替换后作为用户消息进入模型轮次。
+func TestE2ECustomCommand(t *testing.T) {
+	cmdsDir := t.TempDir()
+	mock := testutil.NewMockChat(func(n int, r testutil.RecordedRequest) model.Message {
+		return model.Message{Role: "assistant", Content: fmt.Sprintf("echo-%d", n)}
+	})
+	defer mock.Close()
+
+	write, waitFor, waitExit := serveIn(t, []string{
+		"--api-key", "test",
+		"--base-url", mock.URL(),
+		"--model", "m",
+		"--commands-dir", cmdsDir,
+	})
+
+	if err := os.WriteFile(filepath.Join(cmdsDir, "greet.md"), []byte("Say hello to $ARGUMENTS."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("[cmd] greet loaded")
+	write("/greet world\n")
+	waitFor("echo-1")
+	reqs := mock.Requests()
+	if len(reqs[0].Messages) != 1 || reqs[0].Messages[0].Content != "Say hello to world." {
+		t.Fatalf("$ARGUMENTS must become the user message: %+v", reqs[0].Messages)
+	}
+	write("/quit\n")
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+}
+
+// E2E/Sessions（spec M11）：REPL 默认把会话自动持久化进会话目录
+// （STC_AGENT_SESSIONS_DIR 可覆盖）；--sessions 列出；--resume latest
+// 重放最新会话。
+func TestE2ESessions(t *testing.T) {
+	sdir := t.TempDir()
+	mock := testutil.NewMockChat(func(n int, _ testutil.RecordedRequest) model.Message {
+		return model.Message{Role: "assistant", Content: fmt.Sprintf("reply-%d", n)}
+	})
+	defer mock.Close()
+
+	env := map[string]string{"STC_AGENT_SESSIONS_DIR": sdir}
+	common := []string{"--api-key", "test", "--base-url", mock.URL(), "--model", "m"}
+
+	// 第一程：无 --transcript，会话自动落盘。
+	write, waitFor, waitExit := serveInEnv(t, env, common)
+	write("remember the secret word is mango\n")
+	waitFor("reply-1")
+	write("/quit\n")
+	if code := waitExit(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	infos, err := session.List(sdir)
+	if err != nil || len(infos) != 1 {
+		t.Fatalf("auto-persisted session: %+v, %v", infos, err)
+	}
+	if infos[0].Display() != "remember the secret word is mango" {
+		t.Fatalf("listing falls back to first user line: %q", infos[0].Display())
+	}
+
+	// --sessions 列出（无需 API key）。
+	out := &syncBuffer{}
+	code := run([]string{"--sessions"}, strings.NewReader(""), out, func(k string) string { return env[k] })
+	if code != 0 {
+		t.Fatalf("--sessions exit %d; output:\n%s", code, out.String())
+	}
+	if !out.Contains("remember the secret word is mango") || !out.Contains(infos[0].Path) {
+		t.Fatalf("--sessions output: %s", out.String())
+	}
+
+	// --resume latest：重放后首轮请求带完整历史（user + assistant）。
+	write2, waitFor2, waitExit2 := serveInEnv(t, env, append(common, "--resume", "latest"))
+	write2("what was the secret?\n")
+	waitFor2("reply-2")
+	reqs := mock.Requests()
+	// mock 计数跨进程共享（同一 server）：第三程的首请求 = 全局第 3 个。
+	last := reqs[len(reqs)-1]
+	if len(last.Messages) != 3 || last.Messages[0].Content != "remember the secret word is mango" ||
+		last.Messages[1].Role != "assistant" {
+		t.Fatalf("resumed history must flow into the request: %+v", last.Messages)
+	}
+	write2("/quit\n")
+	if code := waitExit2(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+}
+
+// 配置级 shell hooks 解析：合法事件入 opts、未知事件 fail-fast。
+func TestParseOptionsShellHooks(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	env := func(string) string { return "" }
+
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(`{"hooks":{"agent/turn-end":"echo done"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := parseOptions([]string{"--config", p}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.shellHooks["agent/turn-end"] != "echo done" {
+		t.Fatalf("hooks parse: %+v", opts.shellHooks)
+	}
+
+	if err := os.WriteFile(p, []byte(`{"hooks":{"nope/event":"x"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseOptions([]string{"--config", p}, env); err == nil || !strings.Contains(err.Error(), "unknown event") {
+		t.Fatalf("unknown hook event must fail fast: %v", err)
+	}
+}
+
+// --show-thinking 旗帜进配置。
+func TestParseOptionsShowThinking(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	env := func(string) string { return "" }
+	opts, err := parseOptions([]string{"--show-thinking", "--api-key", "k"}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.cfg.ShowThinking {
+		t.Fatal("--show-thinking must set cfg.ShowThinking")
 	}
 }

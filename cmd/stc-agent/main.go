@@ -15,6 +15,11 @@
 // M10: the tool kit (edit/glob/grep, spill, session_title), web tools
 // (web_fetch/web_search, SSRF-guarded), and define_guest — the model writes
 // a Go guest tool that the host compiles with TinyGo and loads as a fiber.
+// M11: common-denominator agent features — AGENTS.md project instructions,
+// diff previews in the approval gate, session management (auto-persist,
+// --sessions, --resume latest), custom slash commands (commands.d/*.md),
+// per-turn token display, --bell, --show-thinking, and config-level shell
+// hooks.
 package main
 
 import (
@@ -31,10 +36,12 @@ import (
 	"github.com/0xdenny218/stc-agent/internal/approval"
 	"github.com/0xdenny218/stc-agent/internal/cli"
 	"github.com/0xdenny218/stc-agent/internal/config"
+	"github.com/0xdenny218/stc-agent/internal/customcmd"
 	"github.com/0xdenny218/stc-agent/internal/define"
 	"github.com/0xdenny218/stc-agent/internal/guest"
 	"github.com/0xdenny218/stc-agent/internal/hooks"
 	"github.com/0xdenny218/stc-agent/internal/inspect"
+	"github.com/0xdenny218/stc-agent/internal/instructions"
 	"github.com/0xdenny218/stc-agent/internal/interaction"
 	"github.com/0xdenny218/stc-agent/internal/jobs"
 	"github.com/0xdenny218/stc-agent/internal/loop"
@@ -61,12 +68,17 @@ type options struct {
 	transcript       string
 	toolsDir         string
 	skillsDir        string
+	commandsDir      string
 	spillDir         string
 	authoredDir      string
 	tinygo           string
 	mcpServers       []mcp.Server
+	shellHooks       map[string]string
+	bell             bool
 	compactThreshold int
 	print            string
+	listSessions     bool
+	sessionsDir      string
 }
 
 func defaultConfig() config.Config {
@@ -90,13 +102,17 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 		resume     = fs.String("resume", "", "alias of --transcript: resume from this transcript file")
 		toolsDir   = fs.String("tools-dir", "tools.d", "directory of *.wasm guest tools (watched for hot-swap)")
 		skillsDir  = fs.String("skills-dir", "skills.d", "directory of skills (each <name>/SKILL.md hot-loads as a fiber)")
+		cmdsDir    = fs.String("commands-dir", "commands.d", "directory of custom slash commands (each <name>.md hot-loads; $ARGUMENTS in the body receives the args)")
 		spillDir   = fs.String("spill-dir", "spill", "directory where the spill tool writes scratch files")
 		authored   = fs.String("authored-dir", "", "directory for model-authored guest tools (default <tools-dir>/authored)")
 		tinygoBin  = fs.String("tinygo", "", "tinygo executable for define_guest (default: from PATH)")
+		showThink  = fs.Bool("show-thinking", false, "stream model reasoning (reasoning_content and inline <think>) instead of hiding it")
+		bell       = fs.Bool("bell", false, "ring the terminal bell when a turn ends")
 		printShort = fs.String("p", "", "print mode: run a single turn non-interactively and exit")
 		printLong  = fs.String("print", "", "alias of -p")
 		allow      = fs.String("allow", "", "comma-separated tool names to auto-approve (\"*\" allows all)")
 		compact    = fs.Int("compact-threshold", 100000, "compact history when a turn's prompt tokens exceed this (0 disables)")
+		sessions   = fs.Bool("sessions", false, "list past sessions (title + path) and exit")
 		mcpSpecs   []string
 	)
 	fs.Var(funcValue(func(v string) error { mcpSpecs = append(mcpSpecs, v); return nil }),
@@ -108,6 +124,7 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	cfg := defaultConfig()
 	policy := approval.DefaultPolicy()
 	var servers []mcp.Server
+	var shellHooks map[string]string
 
 	path := *configPath
 	if path == "" {
@@ -119,7 +136,7 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 		}
 	}
 	if path != "" {
-		filePolicy, fileServers, err := mergeFile(&cfg, path)
+		filePolicy, fileServers, fileHooks, err := mergeFile(&cfg, path)
 		if err != nil {
 			return options{}, err
 		}
@@ -127,6 +144,7 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 			policy = *filePolicy
 		}
 		servers = append(servers, fileServers...)
+		shellHooks = fileHooks
 	}
 
 	if v := firstNonEmpty(getenv("STC_AGENT_API_KEY"), getenv("DEEPSEEK_API_KEY"), getenv("OPENAI_API_KEY")); v != "" {
@@ -151,6 +169,9 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if *timeout != 0 {
 		cfg.Timeout = *timeout
 	}
+	if *showThink {
+		cfg.ShowThinking = true
+	}
 	if *allow != "" {
 		policy.Allow = append(policy.Allow, strings.Split(*allow, ",")...)
 	}
@@ -166,6 +187,18 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if *resume != "" {
 		tp = *resume
 	}
+	// --resume latest：取会话目录里最新的一个（session.List 按 mtime 降序）。
+	sdir := sessionsDir(getenv)
+	if tp == "latest" {
+		infos, err := session.List(sdir)
+		if err != nil {
+			return options{}, err
+		}
+		if len(infos) == 0 {
+			return options{}, fmt.Errorf("--resume latest: no sessions in %s", sdir)
+		}
+		tp = infos[0].Path
+	}
 	pp := *printShort
 	if *printLong != "" {
 		pp = *printLong
@@ -176,7 +209,35 @@ func parseOptions(args []string, getenv func(string) string) (options, error) {
 	if ad == "" {
 		ad = filepath.Join(*toolsDir, "authored")
 	}
-	return options{cfg: cfg, policy: policy, transcript: tp, toolsDir: *toolsDir, skillsDir: *skillsDir, spillDir: *spillDir, authoredDir: ad, tinygo: *tinygoBin, mcpServers: servers, compactThreshold: *compact, print: pp}, nil
+	return options{cfg: cfg, policy: policy, transcript: tp, toolsDir: *toolsDir, skillsDir: *skillsDir, commandsDir: *cmdsDir, spillDir: *spillDir, authoredDir: ad, tinygo: *tinygoBin, mcpServers: servers, shellHooks: shellHooks, bell: *bell, compactThreshold: *compact, print: pp, listSessions: *sessions, sessionsDir: sdir}, nil
+}
+
+// sessionsDir 是历史会话目录：STC_AGENT_SESSIONS_DIR 覆盖，默认
+// ~/.config/stc-agent/sessions（与配置文件同根，便于发现）。
+func sessionsDir(getenv func(string) string) string {
+	if v := getenv("STC_AGENT_SESSIONS_DIR"); v != "" {
+		return v
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".config", "stc-agent", "sessions")
+	}
+	return "sessions"
+}
+
+// newSessionPath 生成一个不冲突的新会话文件路径（本地时间戳；同秒冲突
+// 时加序号后缀）。
+func newSessionPath(dir string) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	base := time.Now().Format("20060102-150405")
+	p := filepath.Join(dir, base+".jsonl")
+	for i := 2; ; i++ {
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			return p, nil
+		}
+		p = filepath.Join(dir, fmt.Sprintf("%s-%d.jsonl", base, i))
+	}
 }
 
 // funcValue 把单值回调适配成 flag.Value（--mcp 这类可重复旗标）。
@@ -200,24 +261,26 @@ func parseMCPSpec(v string) (mcp.Server, error) {
 
 // fileConfig 是配置文件的子集（timeout 只走命令行）。
 type fileConfig struct {
-	BaseURL  string           `json:"base_url"`
-	APIKey   string           `json:"api_key"`
-	Model    string           `json:"model"`
-	Approval *approval.Policy `json:"approval"`
-	MCP      []mcp.Server     `json:"mcp"`
+	BaseURL      string            `json:"base_url"`
+	APIKey       string            `json:"api_key"`
+	Model        string            `json:"model"`
+	ShowThinking bool              `json:"show_thinking"`
+	Approval     *approval.Policy  `json:"approval"`
+	MCP          []mcp.Server      `json:"mcp"`
+	Hooks        map[string]string `json:"hooks"`
 }
 
 // mergeFile 把配置文件并入 cfg，返回文件携带的审批策略（无则 nil——
 // 策略不经 config.Config：它是启动期输入，与 transcript/toolsDir 同族，
-// 不随 /model 级联热换）与 MCP server 列表。
-func mergeFile(cfg *config.Config, path string) (*approval.Policy, []mcp.Server, error) {
+// 不随 /model 级联热换）、MCP server 列表与 shell hooks。
+func mergeFile(cfg *config.Config, path string) (*approval.Policy, []mcp.Server, map[string]string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read config file: %w", err)
+		return nil, nil, nil, fmt.Errorf("read config file: %w", err)
 	}
 	var fc fileConfig
 	if err := json.Unmarshal(b, &fc); err != nil {
-		return nil, nil, fmt.Errorf("parse config file %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("parse config file %s: %w", path, err)
 	}
 	if fc.BaseURL != "" {
 		cfg.BaseURL = fc.BaseURL
@@ -228,12 +291,20 @@ func mergeFile(cfg *config.Config, path string) (*approval.Policy, []mcp.Server,
 	if fc.Model != "" {
 		cfg.Model = fc.Model
 	}
+	if fc.ShowThinking {
+		cfg.ShowThinking = true
+	}
 	for i, srv := range fc.MCP {
 		if srv.Name == "" || srv.Command == "" {
-			return nil, nil, fmt.Errorf("config file %s: mcp[%d] needs name and command", path, i)
+			return nil, nil, nil, fmt.Errorf("config file %s: mcp[%d] needs name and command", path, i)
 		}
 	}
-	return fc.Approval, fc.MCP, nil
+	for ev := range fc.Hooks {
+		if !hooks.ShellHookEvents[ev] {
+			return nil, nil, nil, fmt.Errorf("config file %s: hooks: unknown event %q (want one of agent/turn-start, agent/turn-end, tools/pre-execute, tools/post-execute)", path, ev)
+		}
+	}
+	return fc.Approval, fc.MCP, fc.Hooks, nil
 }
 
 func firstNonEmpty(vs ...string) string {
@@ -255,6 +326,24 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	if err != nil {
 		fmt.Fprintf(stdout, "error: %v\n", err)
 		return 2
+	}
+	// --sessions 只读列出，不需要 API key，先于校验与装配。
+	if opts.listSessions {
+		infos, err := session.List(opts.sessionsDir)
+		if err != nil {
+			fmt.Fprintf(stdout, "error: %v\n", err)
+			return 1
+		}
+		if len(infos) == 0 {
+			fmt.Fprintf(stdout, "no sessions in %s\n", opts.sessionsDir)
+			return 0
+		}
+		fmt.Fprintf(stdout, "sessions (newest first):\n")
+		for i, info := range infos {
+			fmt.Fprintf(stdout, "  %d. %s  %s  %s\n", i+1, info.ModTime.Format("2006-01-02 15:04"),
+				info.Display(), info.Path)
+		}
+		return 0
 	}
 	if err := opts.cfg.Validate(); err != nil {
 		fmt.Fprintf(stdout, "error: %v\n", err)
@@ -292,6 +381,16 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		console = cli.NewConsole(stdin, stdout)
 		defer console.Close()
 		ia = cli.TerminalInteraction(console)
+		// REPL 默认把会话自动持久化进会话目录（--transcript 显式给出
+		// 时不覆盖）；-p 一次性模式保持即抛（要留痕就显式传路径）。
+		if opts.transcript == "" {
+			p, err := newSessionPath(opts.sessionsDir)
+			if err != nil {
+				fmt.Fprintf(stdout, "error: %v\n", err)
+				return 1
+			}
+			opts.transcript = p
+		}
 	} else {
 		ia = interaction.Deny()
 	}
@@ -364,6 +463,28 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 				fmt.Fprintf(stdout, "[skill] %s unloaded\n", name)
 			}
 		}))
+	// M11：AGENTS.md 项目指令段落（对话中编辑热生效）+ 自定义斜杠命令
+	// （commands.d/*.md 落盘即装、删除即卸、修改即重载）。
+	comps = append(comps, instructions.Component(cwd))
+	comps = append(comps, customcmd.SupervisorComponent(root, opts.commandsDir,
+		func(name string, err error) {
+			fmt.Fprintf(stdout, "[cmd] %s: %v\n", name, err)
+		},
+		func(name string, loaded bool) {
+			if loaded {
+				fmt.Fprintf(stdout, "[cmd] %s loaded\n", name)
+			} else {
+				fmt.Fprintf(stdout, "[cmd] %s unloaded\n", name)
+			}
+		}))
+	// M11：配置级 shell hooks（事件 → 命令；pre-execute 退出码非 0 即拦截）。
+	if len(opts.shellHooks) > 0 {
+		comps = append(comps, hooks.ShellComponent(opts.shellHooks, stdout, 10*time.Second))
+	}
+	// M11：轮次结束响铃。
+	if opts.bell {
+		comps = append(comps, hooks.BellComponent(stdout))
+	}
 	// MCP stdio servers（spec M8）：每个 server 一个 fiber，断开 = 工具失效。
 	for _, srv := range opts.mcpServers {
 		comps = append(comps, mcp.Component(srv, func(s string) {
@@ -375,6 +496,11 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 		cli.ModelCommandComponent(),
 		cli.ToolsCommandComponent(),
 		cli.HelpCommandComponent(),
+		// M11：/resume 列出历史会话（读默认会话目录）。
+		cli.ResumeCommandComponent(func() []session.Info {
+			infos, _ := session.List(opts.sessionsDir)
+			return infos
+		}),
 	)
 	fibers := make([]*stc.Fiber, 0, len(comps)+1)
 	for _, c := range comps {

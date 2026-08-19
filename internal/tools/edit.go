@@ -55,5 +55,31 @@ func EditComponent() stc.Component {
 			}
 			return fmt.Sprintf("replaced %d occurrence(s) in %s (%d bytes)", n, a.Path, len(replaced)), nil
 		},
+		// 预览 = 现有内容 vs 替换后内容的统一 diff；命中失败时把将要报的
+		// 错误先亮出来（用户在 y/n 时就能看到问题）。
+		Preview: func(args json.RawMessage) string {
+			var a struct {
+				Path       string `json:"path"`
+				Old        string `json:"old_string"`
+				New        string `json:"new_string"`
+				ReplaceAll bool   `json:"replace_all"`
+			}
+			if err := json.Unmarshal(args, &a); err != nil || a.Path == "" || a.Old == "" {
+				return ""
+			}
+			b, err := os.ReadFile(a.Path)
+			if err != nil {
+				return fmt.Sprintf("edit %s: %v", a.Path, err)
+			}
+			content := string(b)
+			n := strings.Count(content, a.Old)
+			if n == 0 {
+				return fmt.Sprintf("edit %s: old_string not found", a.Path)
+			}
+			if n > 1 && !a.ReplaceAll {
+				return fmt.Sprintf("edit %s: old_string appears %d times (needs more context or replace_all)", a.Path, n)
+			}
+			return unifiedDiff(a.Path, content, strings.ReplaceAll(content, a.Old, a.New))
+		},
 	})
 }

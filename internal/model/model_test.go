@@ -46,7 +46,7 @@ func TestChatClientContract(t *testing.T) {
 		defer srv.Close()
 
 		var deltas []string
-		c := NewClient(srv.URL, "k", "m1", time.Second)
+		c := NewClient(srv.URL, "k", "m1", time.Second, false)
 		resp, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "hi"}}},
 			func(d string) { deltas = append(deltas, d) })
 		if err != nil {
@@ -94,7 +94,7 @@ func TestChatClientContract(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		c := NewClient(srv.URL, "k", "m1", time.Second)
+		c := NewClient(srv.URL, "k", "m1", time.Second, false)
 		_, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "hi"}}}, nil)
 		var ce *ChatError
 		if !errors.As(err, &ce) {
@@ -111,7 +111,7 @@ func TestChatClientContract(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		c := NewClient(srv.URL, "k", "m1", 20*time.Millisecond)
+		c := NewClient(srv.URL, "k", "m1", 20*time.Millisecond, false)
 		_, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "hi"}}}, nil)
 		var ce *ChatError
 		if !errors.As(err, &ce) || ce.Kind != KindTimeout {
@@ -125,7 +125,7 @@ func TestChatClientContract(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		c := NewClient(srv.URL, "k", "m1", time.Second)
+		c := NewClient(srv.URL, "k", "m1", time.Second, false)
 		_, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "hi"}}}, nil)
 		var ce *ChatError
 		if !errors.As(err, &ce) || ce.Kind != KindProtocol {
@@ -139,7 +139,7 @@ func TestChatClientContract(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		c := NewClient(srv.URL, "k", "m1", time.Second)
+		c := NewClient(srv.URL, "k", "m1", time.Second, false)
 		_, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "hi"}}}, nil)
 		var ce *ChatError
 		if !errors.As(err, &ce) || ce.Kind != KindProtocol {
@@ -164,7 +164,7 @@ func TestStreamAssembly(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "k", "m1", time.Second)
+	c := NewClient(srv.URL, "k", "m1", time.Second, false)
 	resp, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "x"}}}, nil)
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
@@ -233,7 +233,7 @@ func TestStreamThinkStripped(t *testing.T) {
 	defer srv.Close()
 
 	var deltas []string
-	c := NewClient(srv.URL, "k", "m1", time.Second)
+	c := NewClient(srv.URL, "k", "m1", time.Second, false)
 	resp, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "x"}}},
 		func(d string) { deltas = append(deltas, d) })
 	if err != nil {
@@ -245,6 +245,82 @@ func TestStreamThinkStripped(t *testing.T) {
 	if got := strings.Join(deltas, ""); got != "answer" {
 		t.Fatalf("onDelta stream must be stripped too: %q (deltas %q)", got, deltas)
 	}
+}
+
+// Contract/ShowThinking：reasoning_content 只在开启时流出（且不入库），
+// 内联 <think> 段开启时原样透传、关闭时净化。
+func TestShowThinking(t *testing.T) {
+	newSrv := func(fn http.HandlerFunc) *httptest.Server {
+		return httptest.NewServer(fn)
+	}
+
+	t.Run("reasoning streams when enabled, never stored", func(t *testing.T) {
+		srv := newSrv(func(w http.ResponseWriter, _ *http.Request) {
+			sseLines(w,
+				`{"choices":[{"delta":{"role":"assistant","reasoning_content":"let me think "}}]}`,
+				`{"choices":[{"delta":{"reasoning_content":"hard"}}]}`,
+				`{"choices":[{"delta":{"content":"answer"}}]}`,
+				`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+				`[DONE]`,
+			)
+		})
+		defer srv.Close()
+		var deltas []string
+		c := NewClient(srv.URL, "k", "m1", time.Second, true)
+		resp, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "x"}}},
+			func(d string) { deltas = append(deltas, d) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(deltas, ""); got != "let me think hardanswer" {
+			t.Fatalf("reasoning must stream when enabled: %q", got)
+		}
+		if resp.Message.Content != "answer" {
+			t.Fatalf("reasoning must not be stored: %q", resp.Message.Content)
+		}
+	})
+
+	t.Run("reasoning hidden when disabled", func(t *testing.T) {
+		srv := newSrv(func(w http.ResponseWriter, _ *http.Request) {
+			sseLines(w,
+				`{"choices":[{"delta":{"role":"assistant","reasoning_content":"hidden"}}]}`,
+				`{"choices":[{"delta":{"content":"answer"}}]}`,
+				`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+				`[DONE]`,
+			)
+		})
+		defer srv.Close()
+		var deltas []string
+		c := NewClient(srv.URL, "k", "m1", time.Second, false)
+		_, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "x"}}},
+			func(d string) { deltas = append(deltas, d) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(deltas, ""); got != "answer" {
+			t.Fatalf("reasoning must be hidden when disabled: %q", got)
+		}
+	})
+
+	t.Run("inline think passes through when enabled", func(t *testing.T) {
+		srv := newSrv(func(w http.ResponseWriter, _ *http.Request) {
+			sseLines(w,
+				`{"choices":[{"delta":{"role":"assistant","content":"<think>draft</think>"}}]}`,
+				`{"choices":[{"delta":{"content":"answer"}}]}`,
+				`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+				`[DONE]`,
+			)
+		})
+		defer srv.Close()
+		c := NewClient(srv.URL, "k", "m1", time.Second, true)
+		resp, err := c.Chat(stdctx.Background(), ChatRequest{Messages: []Message{{Role: "user", Content: "x"}}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Message.Content != "<think>draft</think>answer" {
+			t.Fatalf("inline think must pass through when enabled: %q", resp.Message.Content)
+		}
+	})
 }
 
 // Contract/ChatTools：tools 请求的线格式（spec M2；OpenAI 工具调用协议）。
@@ -262,7 +338,7 @@ func TestChatClientTools(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "k", "m1", time.Second)
+	c := NewClient(srv.URL, "k", "m1", time.Second, false)
 	resp, err := c.Chat(stdctx.Background(), ChatRequest{
 		Messages: []Message{{Role: "user", Content: "read /tmp/x"}},
 		Tools: []ToolSpec{{

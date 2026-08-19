@@ -75,5 +75,20 @@ func WriteFileComponent() stc.Component {
 			}
 			return fmt.Sprintf("wrote %d bytes to %s", len(a.Content), a.Path), nil
 		},
+		// 预览 = 现有内容 vs 新内容的统一 diff；新文件即"从空创建"。
+		Preview: func(args json.RawMessage) string {
+			var a struct {
+				Path    string `json:"path"`
+				Content string `json:"content"`
+			}
+			if err := json.Unmarshal(args, &a); err != nil || a.Path == "" {
+				return ""
+			}
+			old, err := os.ReadFile(a.Path)
+			if err != nil {
+				return unifiedDiff(a.Path+" (new file)", "", a.Content)
+			}
+			return unifiedDiff(a.Path, string(old), a.Content)
+		},
 	})
 }

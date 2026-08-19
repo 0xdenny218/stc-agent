@@ -29,7 +29,10 @@ func (ti terminalInteraction) Ask(ctx stdctx.Context, q interaction.Question) (s
 	w := ti.c.out
 	fmt.Fprintf(w, "\n! %s\n", q.Title)
 	if q.Detail != "" {
-		fmt.Fprintf(w, "  %s\n", q.Detail)
+		// 逐行缩进两格：diff 预览是多行的，缩进对齐问题标题。
+		for _, line := range strings.Split(q.Detail, "\n") {
+			fmt.Fprintf(w, "  %s\n", line)
+		}
 	}
 	labels := make([]string, len(q.Options))
 	for i, o := range q.Options {

@@ -115,15 +115,16 @@ func (e *ChatError) Error() string {
 func (e *ChatError) Unwrap() error { return e.Err }
 
 type client struct {
-	baseURL string
-	apiKey  string
-	model   string
-	timeout time.Duration
-	hc      *http.Client
+	baseURL      string
+	apiKey       string
+	model        string
+	timeout      time.Duration
+	showThinking bool
+	hc           *http.Client
 }
 
-func NewClient(baseURL, apiKey, model string, timeout time.Duration) ChatService {
-	return &client{baseURL: baseURL, apiKey: apiKey, model: model, timeout: timeout, hc: &http.Client{}}
+func NewClient(baseURL, apiKey, model string, timeout time.Duration, showThinking bool) ChatService {
+	return &client{baseURL: baseURL, apiKey: apiKey, model: model, timeout: timeout, showThinking: showThinking, hc: &http.Client{}}
 }
 
 func (c *client) Model() string { return c.model }
@@ -153,12 +154,14 @@ type wireRequest struct {
 
 // wireChunk 是一个 SSE 分片。增量语义：content 追加；tool_calls 按 index
 // 归位、各字段分片追加；usage 只在收尾分片出现（stream_options 开启后）。
+// reasoning_content 是推理模型的思考流（GLM 等）——只做展示，不入会话。
 type wireChunk struct {
 	Choices []struct {
 		Delta struct {
-			Role      string `json:"role"`
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Role             string `json:"role"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
 				Type     string `json:"type"`
@@ -214,7 +217,7 @@ func (c *client) Chat(ctx stdctx.Context, req ChatRequest, onDelta func(string))
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return nil, &ChatError{Kind: KindHTTP, Status: resp.StatusCode, Body: string(snippet)}
 	}
-	res, err := readStream(resp.Body, onDelta)
+	res, err := readStream(resp.Body, onDelta, c.showThinking)
 	if err != nil {
 		var ce *ChatError
 		if errors.As(err, &ce) {
@@ -319,6 +322,7 @@ type assembler struct {
 	onDelta      func(string)
 	content      strings.Builder
 	think        thinkFilter
+	showThinking bool
 	toolCalls    []ToolCall
 	role         string
 	finishReason string
@@ -327,8 +331,8 @@ type assembler struct {
 }
 
 // readStream 消费 SSE 流；只认 "data:" 行，[DONE] 或 EOF 收尾。
-func readStream(body io.Reader, onDelta func(string)) (*ChatResponse, error) {
-	a := &assembler{onDelta: onDelta}
+func readStream(body io.Reader, onDelta func(string), showThinking bool) (*ChatResponse, error) {
+	a := &assembler{onDelta: onDelta, showThinking: showThinking}
 	r := bufio.NewReader(body)
 	for {
 		line, err := r.ReadBytes('\n')
@@ -370,8 +374,16 @@ func (a *assembler) handleLine(line []byte) (done bool, err error) {
 		if d.Role != "" {
 			a.role = d.Role
 		}
+		// 思考流只展示不入库（reasoning_content 与内联 <think> 段是
+		// 两种泄漏形态；showThinking 关闭时后者被 thinkFilter 净化）。
+		if d.ReasoningContent != "" && a.showThinking && a.onDelta != nil {
+			a.onDelta(d.ReasoningContent)
+		}
 		if d.Content != "" {
-			visible := a.think.feed(d.Content)
+			visible := d.Content
+			if !a.showThinking {
+				visible = a.think.feed(d.Content)
+			}
 			if visible != "" {
 				a.content.WriteString(visible)
 				if a.onDelta != nil {
@@ -403,10 +415,12 @@ func (a *assembler) handleLine(line []byte) (done bool, err error) {
 
 func (a *assembler) result() (*ChatResponse, error) {
 	// 收尾放出思考段外暂扣的字面尾巴（如恰好停在 "<thi" 的分片）。
-	if tail := a.think.flush(); tail != "" {
-		a.content.WriteString(tail)
-		if a.onDelta != nil {
-			a.onDelta(tail)
+	if !a.showThinking {
+		if tail := a.think.flush(); tail != "" {
+			a.content.WriteString(tail)
+			if a.onDelta != nil {
+				a.onDelta(tail)
+			}
 		}
 	}
 	if !a.sawChunk {
@@ -435,7 +449,7 @@ func Component() stc.Component {
 			if err != nil {
 				return nil, err
 			}
-			if _, err := c.Provide(KeyChat, NewClient(cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Timeout)); err != nil {
+			if _, err := c.Provide(KeyChat, NewClient(cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Timeout, cfg.ShowThinking)); err != nil {
 				return nil, err
 			}
 			return nil, nil
